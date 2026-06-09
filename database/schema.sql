@@ -155,3 +155,32 @@ CREATE INDEX idx_prereqs_course         ON prerequisites(course_id);
 CREATE INDEX idx_prereqs_parent         ON prerequisites(parent_id);
 CREATE INDEX idx_grade_dist_course      ON grade_distributions(course_id);
 CREATE INDEX idx_grade_dist_term        ON grade_distributions(term);
+
+-- -----------------------------------------------------------------------------
+-- STUDENTS
+-- Stores parsed APAS data for each student session.
+-- A new row is created each time a student uploads their APAS.
+-- We don't require login — sessions are identified by a generated token.
+-- -----------------------------------------------------------------------------
+CREATE TABLE students (
+    id                  SERIAL PRIMARY KEY,
+    session_token       VARCHAR(64) UNIQUE NOT NULL,  -- random token, shared via URL
+    name                VARCHAR(255),
+    student_id_hash     VARCHAR(64),                  -- hashed, never store raw student ID
+    major               VARCHAR(255),
+    college             VARCHAR(255),
+    catalog_year        VARCHAR(50),
+    expected_graduation VARCHAR(50),
+    advisor             VARCHAR(255),
+    credits_earned      NUMERIC(6,2),
+    credits_in_progress NUMERIC(6,2),
+    credits_needed      NUMERIC(6,2),
+    credits_total_required NUMERIC(6,2),
+    gpa_overall         NUMERIC(4,3),
+    gpa_major           NUMERIC(4,3),
+    parsed_apas_json    JSONB,                        -- full parsed APAS stored as JSON
+    created_at          TIMESTAMP DEFAULT NOW(),
+    updated_at          TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_students_token ON students(session_token);

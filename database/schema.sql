@@ -68,6 +68,10 @@ CREATE TABLE courses (
     UNIQUE(institution_id, subject_code, catalog_number)
 );
 
+-- NOTE: Liberal Ed requirement mapping pending.
+-- IDs from CourseDog CSV do not directly map to LE requirement names.
+-- Solution: filter catalog by each LE requirement, export CSV, match IDs.
+-- The 11 LE requirements are documented in scrapers/import_courses.py.
 
 -- -----------------------------------------------------------------------------
 -- COURSE ATTRIBUTES

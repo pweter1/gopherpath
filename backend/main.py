@@ -252,3 +252,33 @@ def get_student(session_token: str):
     finally:
         cursor.close()
         conn.close()
+
+from backend.optimizer import optimize_plan
+
+@app.get("/optimize/{session_token}")
+def optimize_plan_endpoint(session_token: str):
+    """
+    Generates a semester-by-semester course plan for a student.
+    Requires a valid session token from a previous /parse-apas call.
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            "SELECT parsed_apas_json FROM students WHERE session_token = %s",
+            (session_token,)
+        )
+        row = cursor.fetchone()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Session not found.")
+
+        parsed_apas = row[0]
+        plan = optimize_plan(parsed_apas)
+
+        return {"status": "success", "plan": plan}
+
+    finally:
+        cursor.close()
+        conn.close()

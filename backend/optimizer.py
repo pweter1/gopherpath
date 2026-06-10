@@ -164,6 +164,111 @@ def extract_simple_prereqs(subject, number):
             unique.append(p)
 
     return unique
+
+def recommend_courses_for_requirement(requirement_category, completed_courses, max_results=3):
+    """
+    Recommends real courses from the database for an open Liberal Ed
+    or other requirement.
+
+    Strategy:
+      1. Map the requirement category to a CLE attribute value
+      2. Query courses with that CLE attribute
+      3. Filter out courses the student has already completed
+      4. Prefer lower-level courses (easier to fit in schedule)
+      5. Return up to max_results candidates
+
+    Returns a list of course dicts ready to be added as candidates.
+    """
+    # Map APAS requirement category names to our CLE attribute values
+    LE_MAPPING = {
+        'Diversified Core - Biological & Physical Sciences': [
+            'Biological Sciences', 'Physical Sciences'
+        ],
+        'Diversified Core - Historical Perspectives & Social Sciences': [
+            'Historical Perspectives', 'Social Sciences'
+        ],
+        'Diversified Core - Arts/Humanities & Literature': [
+            'Arts/Humanities', 'Literature'
+        ],
+        'Designated Themes - Civic Life and Ethics': [
+            'Civic Life and Ethics'
+        ],
+        'Designated Themes - Global Perspectives': [
+            'Global Perspectives'
+        ],
+        'Designated Themes - Technology and Society': [
+            'Technology and Society'
+        ],
+        'Designated Themes - The Environment': [
+            'The Environment'
+        ],
+        'Diversified Core - Mathematical Thinking': [
+            'Mathematical Thinking'
+        ],
+        'Writing Intensive': [None],  # handled separately via WI attribute
+    }
+
+    # Build set of completed course codes for filtering
+    completed_codes = {
+        f"{c['subject']} {c['number']}"
+        for c in completed_courses
+        if not c.get('is_withdrawn')
+    }
+
+    # Find which CLE values apply to this requirement
+    cle_values = LE_MAPPING.get(requirement_category)
+    if not cle_values or cle_values == [None]:
+        return []
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        results = []
+        for cle_value in cle_values:
+            cursor.execute("""
+                SELECT DISTINCT c.subject_code, c.catalog_number, c.title,
+                       c.credits, c.offered_fall, c.offered_spring
+                FROM courses c
+                JOIN course_attributes ca ON c.id = ca.course_id
+                WHERE ca.attribute = 'CLE'
+                  AND ca.value = %s
+                  AND c.acad_career = 'UGRD'
+                  AND c.credits IS NOT NULL
+                  AND c.credits <= 4
+                ORDER BY c.catalog_number ASC
+                LIMIT 20
+            """, (cle_value,))
+
+            for row in cursor.fetchall():
+                subject, number, title, credits, offered_fall, offered_spring = row
+                code = f"{subject} {number}"
+
+                if code in completed_codes:
+                    continue
+
+                results.append({
+                    "subject": subject,
+                    "number": number,
+                    "title": title,
+                    "credits": float(credits),
+                    "requirement_category": requirement_category,
+                    "is_pinned": False,
+                    "term_locked": None,
+                    "offered_fall": offered_fall,
+                    "offered_spring": offered_spring,
+                    "prereqs": [],
+                    "cle_value": cle_value,
+                })
+
+            if results:
+                break  # Found courses for first matching CLE value
+
+        return results[:max_results]
+
+    finally:
+        cursor.close()
+        conn.close()
 # ---------------------------------------------------------------------------
 # Prerequisite graph
 # ---------------------------------------------------------------------------
@@ -319,10 +424,17 @@ def build_candidate_courses(parsed_apas):
                         "prereqs": prereqs,
                     })
         else:
-            # Open requirement — we need to recommend a course
-            # For now, add a placeholder. Full recommendation engine
-            # uses Claude API + DB query in the next iteration.
-            if credits_needed and credits_needed > 0:
+            # Open requirement — recommend real courses from database
+            recommended = recommend_courses_for_requirement(
+                category,
+                parsed_apas.get("completed_courses", [])
+            )
+
+            if recommended:
+                # Add the first recommendation as the candidate
+                candidates.append(recommended[0])
+            elif credits_needed and credits_needed > 0:
+                # Fallback to placeholder if no recommendation found
                 candidates.append({
                     "subject": "TBD",
                     "number": "0000",
@@ -333,6 +445,7 @@ def build_candidate_courses(parsed_apas):
                     "term_locked": None,
                     "offered_fall": True,
                     "offered_spring": True,
+                    "prereqs": [],
                 })
 
     return candidates

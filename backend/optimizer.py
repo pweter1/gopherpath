@@ -390,9 +390,20 @@ def build_candidate_courses(parsed_apas):
         options = req.get("options", [])
         credits_needed = req.get("credits_needed")
 
-        # Skip meta-requirements (total credit counts)
-        if category in ["University Credit and GPA Requirements",
-                        "Major Requirements - Minimum Major Credits"]:
+        # Skip meta-requirements (total credit counts, GPA requirements)
+        # These are degree-level checks, not schedulable courses
+        skip_keywords = [
+            "Minimum Degree Credits",
+            "Minimum Major Credits",
+            "Major GPA",
+            "University Credit",
+            "GPA Requirements",
+            "S Grade Credit",
+            "Credits Completed",
+            "Degree-Applicable",
+            "Elective Credits",
+        ]
+        if any(keyword.lower() in category.lower() for keyword in skip_keywords):
             continue
 
         if options:

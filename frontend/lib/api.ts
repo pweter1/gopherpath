@@ -22,6 +22,9 @@ export interface Course {
   title: string;
   credits: number;
   requirement_category: string;
+  // All requirement categories this single course satisfies (double-dip).
+  // Defaults to [requirement_category] for older/cached plans.
+  satisfies_categories?: string[];
   is_pinned: boolean;
 }
 

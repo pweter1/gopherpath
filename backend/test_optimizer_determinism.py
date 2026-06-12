@@ -5,8 +5,13 @@ Regression test: optimize_plan() must produce identical Liberal Ed
 requirement resolutions across repeated runs with the same input.
 
 Runs optimize_plan() 5 times with the same APAS data and preferences,
-then asserts the course resolved for each Liberal Ed category is
-identical across all runs — and that none of them is a TBD placeholder.
+then asserts:
+  - the course resolved for each Liberal Ed category is identical
+    across all runs
+  - none of them is a TBD placeholder
+  - every recommended Liberal Ed course meets UMN's per-course credit
+    minimum (3cr; 4cr for Biological & Physical Sciences)
+  - no recommended course is an Honors-restricted (H-suffix) section
 
 Usage:  python backend/test_optimizer_determinism.py
 """
@@ -17,7 +22,11 @@ import os
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from optimizer import optimize_plan  # noqa: E402
+from optimizer import (  # noqa: E402
+    optimize_plan,
+    MIN_LE_COURSE_CREDITS,
+    MIN_BIO_PHYS_COURSE_CREDITS,
+)
 
 N_RUNS = 5
 
@@ -41,6 +50,47 @@ def extract_le_resolutions(result):
         if _is_liberal_ed(cat) and cat not in resolutions:
             resolutions[cat] = f"{course['subject']} {course['number']} (unscheduled)"
     return resolutions
+
+
+def check_le_eligibility(label, result):
+    """
+    Verify every Liberal Ed course in the plan is actually eligible to
+    fulfill its requirement: meets the UMN per-course credit minimum and
+    is not an Honors-restricted (H-suffix) section.
+    """
+    failures = []
+    for term in result["plan"]:
+        for course in term["courses"]:
+            cat = course["requirement_category"]
+            if not _is_liberal_ed(cat) or course["subject"] == "TBD":
+                continue
+            code = f"{course['subject']} {course['number']}"
+            if course["number"].upper().endswith("H"):
+                failures.append(
+                    f"[{label}] HONORS-RESTRICTED: {code} recommended for {cat!r}"
+                )
+            min_credits = (
+                MIN_BIO_PHYS_COURSE_CREDITS
+                if "Biological & Physical Sciences" in cat
+                else MIN_LE_COURSE_CREDITS
+            )
+            if course["credits"] < min_credits:
+                failures.append(
+                    f"[{label}] BELOW CREDIT MINIMUM: {code} "
+                    f"({course['credits']}cr < {min_credits}cr) for {cat!r}"
+                )
+    # unscheduled courses carry no credits in the formatted output;
+    # still catch Honors-restricted recommendations there
+    for course in result["unscheduled"]:
+        cat = course["requirement_category"]
+        if not _is_liberal_ed(cat) or course["subject"] == "TBD":
+            continue
+        if course["number"].upper().endswith("H"):
+            failures.append(
+                f"[{label}] HONORS-RESTRICTED (unscheduled): "
+                f"{course['subject']} {course['number']} for {cat!r}"
+            )
+    return failures
 
 
 def load_db_parse():
@@ -68,16 +118,17 @@ def run_suite(label, parsed_apas, preferences):
     """Run optimize_plan N_RUNS times; return list of failure strings."""
     print(f"=== Input: {label} ===")
     all_runs = []
+    failures = []
     for i in range(N_RUNS):
         result = optimize_plan(parsed_apas, preferences)
         resolutions = extract_le_resolutions(result)
         all_runs.append(resolutions)
+        if i == 0:
+            failures += check_le_eligibility(label, result)
         print(f"--- Run {i + 1} ---")
         for cat, code in resolutions.items():
             print(f"  {cat}: {code}")
         print()
-
-    failures = []
     baseline = all_runs[0]
     for i, run in enumerate(all_runs[1:], start=2):
         if run != baseline:
@@ -114,6 +165,12 @@ def main():
     db_parse = load_db_parse()
     if db_parse:
         failures += run_suite("latest students-row parse (DB)", db_parse, preferences)
+        # timeline=asap sorts candidates by credits ASC — the ordering that
+        # surfaced 1-credit courses (NURS 4402, FOST 3331H) before the
+        # eligibility filters existed. Keep it covered.
+        asap_prefs = {"difficulty": "any", "timeline": "asap", "free_text": "",
+                      "max_credits_per_semester": 18}
+        failures += run_suite("DB parse, timeline=asap", db_parse, asap_prefs)
 
     if failures:
         print("FAILED:")

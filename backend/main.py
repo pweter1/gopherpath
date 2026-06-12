@@ -478,6 +478,7 @@ def _get_candidate_courses_for_chat(cursor, parsed_apas, generated_plan):
                 JOIN course_attributes ca ON c.id = ca.course_id
                 WHERE ca.attribute = 'WI' AND c.acad_career = 'UGRD'
                   AND c.credits IS NOT NULL
+                  AND c.catalog_number !~* 'H$'
                 ORDER BY c.catalog_number ASC, c.subject_code ASC, c.title ASC
                 LIMIT 200
             """)
@@ -493,6 +494,10 @@ def _get_candidate_courses_for_chat(cursor, parsed_apas, generated_plan):
 
         lines = []
         for cle_value in cle_values:
+            # Same eligibility rules as the optimizer: UMN LE credit minimums
+            # (3cr, or 4cr for bio/physical sciences) and no Honors-restricted
+            # (H-suffix) sections — the chat must never suggest a course that
+            # can't actually fulfill the requirement.
             cursor.execute("""
                 SELECT DISTINCT c.subject_code, c.catalog_number, c.title,
                        c.credits, c.offered_fall, c.offered_spring
@@ -500,10 +505,13 @@ def _get_candidate_courses_for_chat(cursor, parsed_apas, generated_plan):
                 JOIN course_attributes ca ON c.id = ca.course_id
                 WHERE ca.attribute = 'CLE' AND ca.value = %s
                   AND c.acad_career = 'UGRD'
-                  AND c.credits IS NOT NULL AND c.credits <= 4
+                  AND c.credits IS NOT NULL
+                  AND c.credits >= %s
+                  AND c.credits <= 4
+                  AND c.catalog_number !~* 'H$'
                 ORDER BY c.catalog_number ASC, c.subject_code ASC, c.title ASC
                 LIMIT 200
-            """, (cle_value,))
+            """, (cle_value, min_credits_for_cle_value(cle_value)))
             for row in cursor.fetchall():
                 if f"{row[0]} {row[1]}" not in exclude:
                     lines.append(fmt_row(row))
@@ -615,7 +623,7 @@ def plan_explanation_endpoint(session_token: str):
     return _stream_claude(system_prompt, [{"role": "user", "content": user_msg}])
 
 
-from backend.optimizer import optimize_plan, match_le_category
+from backend.optimizer import optimize_plan, match_le_category, min_credits_for_cle_value
 
 @app.post("/optimize/{session_token}")
 def optimize_plan_endpoint(session_token: str, preferences: Preferences):

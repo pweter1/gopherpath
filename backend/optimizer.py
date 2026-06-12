@@ -56,6 +56,23 @@ COURSE_ALIASES = {
 
 DEFAULT_MAX_CREDITS = 16
 DEFAULT_MIN_CREDITS = 12
+# timeline="asap" raises the per-semester cap so more courses fit each term
+# (mirrors the value main.py's /optimize endpoint passes for asap)
+ASAP_MAX_CREDITS = 18
+
+# Meta-requirements (total credit counts, GPA requirements) — these are
+# degree-level checks, not schedulable courses
+SKIP_META_KEYWORDS = [
+    "Minimum Degree Credits",
+    "Minimum Major Credits",
+    "Major GPA",
+    "University Credit",
+    "GPA Requirements",
+    "S Grade Credit",
+    "Credits Completed",
+    "Degree-Applicable",
+    "Elective Credits",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +216,64 @@ LE_MAPPING = {
     'Writing Intensive': [None],  # handled separately via WI attribute
 }
 
+# UMN Liberal Education guidelines (curricularhub.umn.edu): a course must
+# "be at least 3 credits (or at least 4 credits for biological or physical
+# sciences, which must include a lab or field experience component)" to
+# carry an LE designation. Recommending below-threshold courses would tell
+# students a requirement is satisfied when it isn't.
+MIN_LE_COURSE_CREDITS = 3.0
+MIN_BIO_PHYS_COURSE_CREDITS = 4.0
+BIO_PHYS_CLE_VALUES = {"Biological Sciences", "Physical Sciences"}
+
+
+def min_credits_for_cle_value(cle_value):
+    """Per-course credit minimum for a CLE attribute value."""
+    if cle_value in BIO_PHYS_CLE_VALUES:
+        return MIN_BIO_PHYS_COURSE_CREDITS
+    return MIN_LE_COURSE_CREDITS
+
+
+# UMN writing requirement (onestop.umn.edu): four WI courses total, two of
+# them upper-division (3xxx+), one of those within the major. The APAS lists
+# the in-major upper-division WI as its own sub-requirement with explicit
+# course options; the bare parent "Writing Intensive" row carries no credit
+# count, so we schedule this many additional upper-division WI courses for it.
+WI_ADDITIONAL_COURSES = 2
+
+
+def is_wi_parent_requirement(category):
+    """
+    True for the bare overall Writing Intensive requirement (with any
+    parser-added prefix), as opposed to named WI sub-requirements like
+    'Writing Intensive - Upper-Division Writing Intensive within the Major'.
+    """
+    return category.strip().endswith("Writing Intensive")
+
+
+def is_parent_header_requirement(req, all_requirements):
+    """
+    True for grouping rows like 'Liberal Education - Designated Themes' that
+    carry no credit count and exist only to group child requirements the APAS
+    parser tracks as separate rows (categories extending this one with
+    ' - ...'). Scheduling such a row would double-count its children.
+
+    The bare Writing Intensive parent also has a tracked child but represents
+    real additional courses (see WI_ADDITIONAL_COURSES), so it is excluded.
+    A credits_needed=None row with NO tracked children is not a header — it
+    is a real requirement and must not be skipped under this rule.
+    """
+    if req.get("credits_needed") is not None:
+        return False
+    category = req.get("category", "")
+    if is_wi_parent_requirement(category):
+        return False
+    prefix = category + " - "
+    return any(
+        other.get("category", "").startswith(prefix)
+        for other in all_requirements
+        if other is not req
+    )
+
 
 def match_le_category(requirement_category):
     """
@@ -265,15 +340,63 @@ def recommend_courses_for_requirement(requirement_category, completed_courses, m
 
     # Find which CLE values apply to this requirement
     cle_values = match_le_category(requirement_category)
-    if not cle_values or cle_values == [None]:
+    if not cle_values:
         return []
 
     conn = get_db_connection()
     cursor = conn.cursor()
 
+    def to_candidate(row, cle_value):
+        subject, number, title, credits, offered_fall, offered_spring = row
+        return {
+            "subject": subject,
+            "number": number,
+            "title": title,
+            "credits": float(credits),
+            "requirement_category": requirement_category,
+            "is_pinned": False,
+            "term_locked": None,
+            "offered_fall": offered_fall,
+            "offered_spring": offered_spring,
+            "prereqs": [],
+            "prereq_raw": "",
+            "cle_value": cle_value,
+        }
+
     try:
+        # [None] is the Writing Intensive sentinel: WI is an attribute, not a
+        # CLE value. Recommend upper-division (3xxx+) WI courses, restricted
+        # to courses with no prerequisites so the recommendation is takeable
+        # exactly as scheduled (the greedy scheduler doesn't know the prereq
+        # chains of recommended courses).
+        if cle_values == [None]:
+            cursor.execute(f"""
+                SELECT DISTINCT c.subject_code, c.catalog_number, c.title,
+                       c.credits, c.offered_fall, c.offered_spring
+                FROM courses c
+                JOIN course_attributes ca ON c.id = ca.course_id
+                WHERE ca.attribute = 'WI'
+                  AND c.acad_career = 'UGRD'
+                  AND c.credits IS NOT NULL
+                  AND c.credits <= 4
+                  AND c.catalog_number >= '3000'
+                  AND c.catalog_number !~* 'H$'
+                  AND (c.prereq_raw IS NULL OR c.prereq_raw = '')
+                ORDER BY {order_clause}
+                LIMIT 100
+            """)
+            results = [
+                to_candidate(row, None)
+                for row in cursor.fetchall()
+                if f"{row[0]} {row[1]}" not in completed_codes
+                and f"{row[0]} {row[1]}" not in already_scheduled
+            ]
+            return results[:max_results]
+
         results = []
         for cle_value in cle_values:
+            # catalog_number ending in H = Honors-restricted section; we don't
+            # track Honors program membership, so never recommend these.
             cursor.execute(f"""
                 SELECT DISTINCT c.subject_code, c.catalog_number, c.title,
                        c.credits, c.offered_fall, c.offered_spring
@@ -283,34 +406,18 @@ def recommend_courses_for_requirement(requirement_category, completed_courses, m
                   AND ca.value = %s
                   AND c.acad_career = 'UGRD'
                   AND c.credits IS NOT NULL
+                  AND c.credits >= %s
                   AND c.credits <= 4
+                  AND c.catalog_number !~* 'H$'
                 ORDER BY {order_clause}
                 LIMIT 100
-            """, (cle_value,))
+            """, (cle_value, min_credits_for_cle_value(cle_value)))
 
             for row in cursor.fetchall():
-                subject, number, title, credits, offered_fall, offered_spring = row
-                code = f"{subject} {number}"
-
-                if code in completed_codes:
+                code = f"{row[0]} {row[1]}"
+                if code in completed_codes or code in already_scheduled:
                     continue
-                if code in already_scheduled:
-                    continue
-
-                results.append({
-                    "subject": subject,
-                    "number": number,
-                    "title": title,
-                    "credits": float(credits),
-                    "requirement_category": requirement_category,
-                    "is_pinned": False,
-                    "term_locked": None,
-                    "offered_fall": offered_fall,
-                    "offered_spring": offered_spring,
-                    "prereqs": [],
-                    "prereq_raw": "",
-                    "cle_value": cle_value,
-                })
+                results.append(to_candidate(row, cle_value))
 
             if results:
                 break  # Found courses for first matching CLE value
@@ -443,20 +550,12 @@ def build_candidate_courses(parsed_apas, preferences=None):
         options = req.get("options", [])
         credits_needed = req.get("credits_needed")
 
-        # Skip meta-requirements (total credit counts, GPA requirements)
-        # These are degree-level checks, not schedulable courses
-        skip_keywords = [
-            "Minimum Degree Credits",
-            "Minimum Major Credits",
-            "Major GPA",
-            "University Credit",
-            "GPA Requirements",
-            "S Grade Credit",
-            "Credits Completed",
-            "Degree-Applicable",
-            "Elective Credits",
-        ]
-        if any(keyword.lower() in category.lower() for keyword in skip_keywords):
+        if any(keyword.lower() in category.lower() for keyword in SKIP_META_KEYWORDS):
+            continue
+
+        # Skip parent/group header rows explicitly — their children are
+        # scheduled as separate requirements (see is_parent_header_requirement)
+        if is_parent_header_requirement(req, parsed_apas.get("remaining_requirements", [])):
             continue
 
         if options:
@@ -516,8 +615,15 @@ def build_candidate_courses(parsed_apas, preferences=None):
             )
 
             if recommended:
-                # Add the first recommendation as the candidate
-                candidates.append(recommended[0])
+                # Most open requirements need a single course; the bare
+                # Writing Intensive parent requirement covers multiple
+                # remaining WI courses (see WI_ADDITIONAL_COURSES)
+                n_needed = (
+                    WI_ADDITIONAL_COURSES
+                    if is_wi_parent_requirement(category)
+                    else 1
+                )
+                candidates.extend(recommended[:n_needed])
             elif credits_needed and credits_needed > 0:
                 # Fallback to placeholder if no recommendation found
                 candidates.append({
@@ -540,6 +646,30 @@ def build_candidate_courses(parsed_apas, preferences=None):
 # Simple greedy scheduler
 # ---------------------------------------------------------------------------
 
+def prereqs_satisfied(prereqs, prereq_raw, satisfied):
+    """
+    Returns True if a course's prerequisites are met by the `satisfied` set
+    of course codes (completed + scheduled in earlier terms).
+
+    extract_simple_prereqs flattens all course codes from the raw text
+    into one list, losing the nested (A or B) and (C or D) structure.
+    all() is safe only when the prereq is a flat AND with no OR groups
+    (e.g. "prereq: STAT 5101 and STAT 5102"). As soon as "or" appears
+    the flattened list can never satisfy all() correctly, so fall back
+    to any() — the student is expected to have met at least one prereq
+    path, and the disclaimer covers advisor verification.
+    """
+    if not prereqs:
+        return True
+    resolved = [COURSE_ALIASES.get(p, p) for p in prereqs]
+    raw = (prereq_raw or "").lower()
+    has_and = " and " in raw
+    has_or = " or " in raw
+    if len(resolved) > 1 and has_and and not has_or:
+        return all(prereq in satisfied for prereq in resolved)
+    return any(prereq in satisfied for prereq in resolved)
+
+
 def greedy_schedule(candidates, completed_courses, preferences=None):
     """
     Assigns courses to semesters using a greedy algorithm.
@@ -561,9 +691,14 @@ def greedy_schedule(candidates, completed_courses, preferences=None):
     if preferences is None:
         preferences = {}
 
-    max_credits = preferences.get("max_credits_per_semester", DEFAULT_MAX_CREDITS)
     difficulty = preferences.get("difficulty", "any")
     timeline = preferences.get("timeline", "on_time")
+    # Explicit max_credits_per_semester wins; otherwise derive the cap from
+    # timeline so the preference has an effect when optimize_plan is called
+    # directly (asap=18, on_time=16).
+    max_credits = preferences.get("max_credits_per_semester")
+    if max_credits is None:
+        max_credits = ASAP_MAX_CREDITS if timeline == "asap" else DEFAULT_MAX_CREDITS
 
     # Build prerequisite graph
     graph = PrerequisiteGraph()
@@ -623,28 +758,9 @@ def greedy_schedule(candidates, completed_courses, preferences=None):
             if not term["is_fall"] and not c.get("offered_spring", True):
                 continue
 
-            # Check prerequisites.
-            # extract_simple_prereqs flattens all course codes from the raw text
-            # into one list, losing the nested (A or B) and (C or D) structure.
-            # all() is safe only when the prereq is a flat AND with no OR groups
-            # (e.g. "prereq: STAT 5101 and STAT 5102"). As soon as "or" appears
-            # the flattened list can never satisfy all() correctly, so fall back
-            # to any() — the student is expected to have met at least one prereq
-            # path, and the disclaimer covers advisor verification.
-            course_prereqs = c.get("prereqs", [])
-            if course_prereqs:
-                resolved_prereqs = [
-                    COURSE_ALIASES.get(p, p) for p in course_prereqs
-                ]
-                prereq_raw = (c.get("prereq_raw") or "").lower()
-                has_and = " and " in prereq_raw
-                has_or  = " or "  in prereq_raw
-                if len(resolved_prereqs) > 1 and has_and and not has_or:
-                    prereqs_met = all(prereq in scheduled for prereq in resolved_prereqs)
-                else:
-                    prereqs_met = any(prereq in scheduled for prereq in resolved_prereqs)
-                if not prereqs_met:
-                    continue
+            # Check prerequisites (see prereqs_satisfied for AND/OR semantics)
+            if not prereqs_satisfied(c.get("prereqs", []), c.get("prereq_raw"), scheduled):
+                continue
             # Don't schedule a course in F26 if its prereq is also in F26
             if term["code"] == "F26":
                 prereqs_in_progress = any(
@@ -685,16 +801,41 @@ def greedy_schedule(candidates, completed_courses, preferences=None):
         ]
 
         for c in available:
+            code = f"{c['subject']} {c['number']}"
+            # Dedup guard: a course that satisfies multiple requirements has
+            # one candidate dict per requirement (a legitimate "double-dip").
+            # Schedule it only once; coverage for the other requirements is
+            # tracked via satisfies_categories below.
+            if code in scheduled:
+                continue
             if current_credits + c["credits"] <= max_credits:
                 plan[term["code"]].append(c)
-                scheduled.add(f"{c['subject']} {c['number']}")
+                scheduled.add(code)
                 current_credits += c["credits"]
 
-    # Identify unscheduled requirements
-    unscheduled = []
+    # Record every requirement category each course code can satisfy, so a
+    # single scheduled course reflects all requirements it double-dips for.
+    code_to_categories = {}
     for c in candidates:
         code = f"{c['subject']} {c['number']}"
-        if code not in scheduled:
+        cats = code_to_categories.setdefault(code, [])
+        if c["requirement_category"] not in cats:
+            cats.append(c["requirement_category"])
+    for term_courses in plan.values():
+        for c in term_courses:
+            code = f"{c['subject']} {c['number']}"
+            c["satisfies_categories"] = code_to_categories.get(
+                code, [c["requirement_category"]]
+            )
+
+    # Identify unscheduled requirements (one entry per code; double-dipped
+    # codes are scheduled, so they never appear here)
+    unscheduled = []
+    seen_unscheduled = set()
+    for c in candidates:
+        code = f"{c['subject']} {c['number']}"
+        if code not in scheduled and code not in seen_unscheduled:
+            seen_unscheduled.add(code)
             unscheduled.append(c)
 
     return plan, unscheduled
@@ -831,6 +972,9 @@ def optimize_plan(parsed_apas, preferences=None):
                     "title": c["title"],
                     "credits": c["credits"],
                     "requirement_category": c["requirement_category"],
+                    "satisfies_categories": c.get(
+                        "satisfies_categories", [c["requirement_category"]]
+                    ),
                     "is_pinned": c["is_pinned"],
                 }
                 for c in term_courses

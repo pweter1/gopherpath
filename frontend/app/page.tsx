@@ -449,17 +449,24 @@ function computeRequirementsCoverage(
   >();
   for (const term of plan.plan) {
     for (const course of term.courses) {
-      if (!scheduledMap.has(course.requirement_category)) {
-        scheduledMap.set(course.requirement_category, {
-          subject: course.subject,
-          number: course.number,
-          termLabel: term.term_label,
-        });
+      // A course may double-dip across requirements; credit every category
+      // it satisfies, not just its primary one.
+      const cats = course.satisfies_categories ?? [course.requirement_category];
+      for (const cat of cats) {
+        if (!scheduledMap.has(cat)) {
+          scheduledMap.set(cat, {
+            subject: course.subject,
+            number: course.number,
+            termLabel: term.term_label,
+          });
+        }
       }
     }
   }
   const unscheduledCategories = new Set(
-    plan.unscheduled.map((c) => c.requirement_category)
+    plan.unscheduled.flatMap(
+      (c) => c.satisfies_categories ?? [c.requirement_category]
+    )
   );
 
   return parsedData.remaining_requirements

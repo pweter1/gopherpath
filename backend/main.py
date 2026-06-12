@@ -469,7 +469,8 @@ def _get_candidate_courses_for_chat(cursor, parsed_apas, generated_plan):
         if any(kw.lower() in category.lower() for kw in _SKIP_KEYWORDS):
             continue
 
-        # Writing Intensive — query by WI attribute
+        # Writing Intensive — query by WI attribute (same quality rules as
+        # the optimizer: no directed studies, 3cr+ norm floor)
         if "Writing Intensive" in category:
             cursor.execute(f"""
                 SELECT DISTINCT c.subject_code, c.catalog_number, c.title,
@@ -478,10 +479,12 @@ def _get_candidate_courses_for_chat(cursor, parsed_apas, generated_plan):
                 JOIN course_attributes ca ON c.id = ca.course_id
                 WHERE ca.attribute = 'WI' AND c.acad_career = 'UGRD'
                   AND c.credits IS NOT NULL
+                  AND c.credits >= %s
                   AND c.catalog_number !~* '{RESTRICTED_SUFFIX_PATTERN}'
+                  AND c.title !~* '{DIRECTED_STUDY_TITLE_PATTERN}'
                 ORDER BY c.catalog_number ASC, c.subject_code ASC, c.title ASC
                 LIMIT 200
-            """)
+            """, (MIN_WI_CREDITS,))
             lines = [fmt_row(r) for r in cursor.fetchall()
                      if f"{r[0]} {r[1]}" not in exclude][:8]
             if lines:
@@ -509,6 +512,7 @@ def _get_candidate_courses_for_chat(cursor, parsed_apas, generated_plan):
                   AND c.credits >= %s
                   AND c.credits <= 4
                   AND c.catalog_number !~* '{RESTRICTED_SUFFIX_PATTERN}'
+                  AND c.title !~* '{DIRECTED_STUDY_TITLE_PATTERN}'
                 ORDER BY c.catalog_number ASC, c.subject_code ASC, c.title ASC
                 LIMIT 200
             """, (cle_value, min_credits_for_cle_value(cle_value)))
@@ -628,6 +632,8 @@ from backend.optimizer import (
     match_le_category,
     min_credits_for_cle_value,
     RESTRICTED_SUFFIX_PATTERN,
+    DIRECTED_STUDY_TITLE_PATTERN,
+    MIN_WI_CREDITS,
 )
 
 @app.post("/optimize/{session_token}")

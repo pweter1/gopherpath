@@ -246,6 +246,24 @@ def is_restricted_section(catalog_number):
     return catalog_number.upper().endswith(RESTRICTED_SECTION_SUFFIXES)
 
 
+# Directed/independent study courses require individual instructor
+# arrangement and permission — they aren't generally enrollable, so they are
+# never recommended (same spirit as RESTRICTED_SECTION_SUFFIXES). Filtered by
+# title because catalog-number conventions vary by department (x793, x794,
+# x993, x994, 4094, ...). SQL regex form, used with !~* (case-insensitive).
+DIRECTED_STUDY_TITLE_PATTERN = (
+    "(directed stud|directed research|directed reading"
+    "|independent stud|individual stud)"
+)
+
+# Quality floor for recommended Writing Intensive courses. UMN publishes no
+# per-course WI credit minimum (unlike the Liberal Ed 3/4cr rule), but the
+# norm is clear: 453 of 491 upper-division WI courses are 3+ credits, and the
+# sub-3cr ones are mostly directed studies/seminars. Norm-based assumption —
+# revisit if a real policy minimum surfaces.
+MIN_WI_CREDITS = 3.0
+
+
 # UMN writing requirement (onestop.umn.edu): four WI courses total, two of
 # them upper-division (3xxx+), one of those within the major. The APAS lists
 # the in-major upper-division WI as its own sub-requirement with explicit
@@ -380,6 +398,7 @@ def recommend_multi_tag_courses(open_le_reqs, completed_courses, preferences=Non
               AND c.credits IS NOT NULL
               AND c.credits <= 4
               AND c.catalog_number !~* '{RESTRICTED_SUFFIX_PATTERN}'
+              AND c.title !~* '{DIRECTED_STUDY_TITLE_PATTERN}'
               AND (c.prereq_raw IS NULL OR c.prereq_raw = '')
             GROUP BY c.id, c.subject_code, c.catalog_number, c.title,
                      c.credits, c.offered_fall, c.offered_spring
@@ -499,13 +518,15 @@ def recommend_courses_for_requirement(requirement_category, completed_courses, m
                 WHERE ca.attribute = 'WI'
                   AND c.acad_career = 'UGRD'
                   AND c.credits IS NOT NULL
+                  AND c.credits >= %s
                   AND c.credits <= 4
                   AND c.catalog_number >= '3000'
                   AND c.catalog_number !~* '{RESTRICTED_SUFFIX_PATTERN}'
+                  AND c.title !~* '{DIRECTED_STUDY_TITLE_PATTERN}'
                   AND (c.prereq_raw IS NULL OR c.prereq_raw = '')
                 ORDER BY {order_clause}
                 LIMIT 100
-            """)
+            """, (MIN_WI_CREDITS,))
             results = [
                 to_candidate(row, None)
                 for row in cursor.fetchall()
@@ -528,6 +549,7 @@ def recommend_courses_for_requirement(requirement_category, completed_courses, m
                   AND c.credits >= %s
                   AND c.credits <= 4
                   AND c.catalog_number !~* '{RESTRICTED_SUFFIX_PATTERN}'
+                  AND c.title !~* '{DIRECTED_STUDY_TITLE_PATTERN}'
                 ORDER BY {order_clause}
                 LIMIT 100
             """, (cle_value, min_credits_for_cle_value(cle_value)))

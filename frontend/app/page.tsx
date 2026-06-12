@@ -17,7 +17,6 @@ import {
   parseAPAS,
   optimizePlan,
   loadSession,
-  saveExplanation,
   saveChatHistory,
   streamChat,
   streamPlanExplanation,
@@ -25,6 +24,7 @@ import {
   Plan,
   ChatMessage,
   SavedMessage,
+  RequirementCoverageItem,
 } from "@/lib/api";
 
 const SESSION_KEY = "gopherpath_session";
@@ -51,7 +51,6 @@ type AppState =
       sessionToken: string;
       parsedData: ParsedAPAS;
       plan: Plan;
-      savedExplanation?: string;
       savedMessages?: SavedMessage[];
     }
   | { stage: "error"; message: string };
@@ -419,10 +418,15 @@ function PreferencesStage({
 }
 
 // ---------------------------------------------------------------------------
-// Requirements coverage component
+// Helpers + requirements coverage card (rendered inside chat bubble)
 // ---------------------------------------------------------------------------
 
-const SKIP_REQUIREMENT_KEYWORDS = [
+function stripPrefix(category: string): string {
+  const idx = category.indexOf(" - ");
+  return idx !== -1 ? category.slice(idx + 3) : category;
+}
+
+const SKIP_KEYWORDS = [
   "Minimum Degree Credits",
   "Minimum Major Credits",
   "Major GPA",
@@ -435,153 +439,85 @@ const SKIP_REQUIREMENT_KEYWORDS = [
   "In Progress",
 ];
 
-function RequirementsCoverage({
-  parsedData,
-  plan,
-}: {
-  parsedData: ParsedAPAS;
-  plan: Plan;
-}) {
-  // Build map: requirement_category → first course + term that satisfies it
-  const scheduledMap = new Map<string, { subject: string; number: string; title: string; termLabel: string }>();
+function computeRequirementsCoverage(
+  parsedData: ParsedAPAS,
+  plan: Plan
+): RequirementCoverageItem[] {
+  const scheduledMap = new Map<
+    string,
+    { subject: string; number: string; termLabel: string }
+  >();
   for (const term of plan.plan) {
     for (const course of term.courses) {
       if (!scheduledMap.has(course.requirement_category)) {
         scheduledMap.set(course.requirement_category, {
           subject: course.subject,
           number: course.number,
-          title: course.title,
           termLabel: term.term_label,
         });
       }
     }
   }
-
-  const unscheduledCategories = new Set(plan.unscheduled.map((c) => c.requirement_category));
-
-  const requirements = parsedData.remaining_requirements.filter(
-    (req: any) =>
-      !SKIP_REQUIREMENT_KEYWORDS.some((kw) =>
-        req.category?.toLowerCase().includes(kw.toLowerCase())
-      )
+  const unscheduledCategories = new Set(
+    plan.unscheduled.map((c) => c.requirement_category)
   );
 
-  if (requirements.length === 0) return null;
-
-  return (
-    <div className="bg-white rounded-xl border border-gray-200 p-6">
-      <h3 className="font-semibold text-gray-900 mb-1">Requirements Coverage</h3>
-      <p className="text-sm text-gray-500 mb-4">
-        Which courses on your plan fulfill each remaining requirement
-      </p>
-      <div className="divide-y divide-gray-100">
-        {requirements.map((req: any, idx: number) => {
-          const hit = scheduledMap.get(req.category);
-          const isUnscheduled = unscheduledCategories.has(req.category);
-
-          return (
-            <div key={idx} className="flex items-start gap-3 py-3">
-              <span
-                className={`mt-0.5 text-sm shrink-0 font-bold ${
-                  hit
-                    ? "text-green-500"
-                    : isUnscheduled
-                    ? "text-amber-500"
-                    : "text-gray-300"
-                }`}
-              >
-                {hit ? "✓" : isUnscheduled ? "⚠" : "○"}
-              </span>
-              <div className="flex-1 min-w-0">
-                <p className="text-sm text-gray-500">{req.category}</p>
-                {hit ? (
-                  <p className="text-sm font-medium text-gray-900 mt-0.5">
-                    {hit.subject} {hit.number} — {hit.title}
-                    <span className="ml-2 text-xs font-normal text-gray-400">
-                      {hit.termLabel}
-                    </span>
-                  </p>
-                ) : isUnscheduled ? (
-                  <p className="text-xs text-amber-600 mt-0.5">
-                    Could not fit into the schedule
-                  </p>
-                ) : (
-                  <p className="text-xs text-gray-400 mt-0.5">
-                    Not addressed in plan
-                  </p>
-                )}
-              </div>
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
+  return parsedData.remaining_requirements
+    .filter(
+      (req: any) =>
+        !SKIP_KEYWORDS.some((kw: string) =>
+          req.category?.toLowerCase().includes(kw.toLowerCase())
+        )
+    )
+    .map((req: any): RequirementCoverageItem => {
+      const hit = scheduledMap.get(req.category);
+      const isUnscheduled = unscheduledCategories.has(req.category);
+      return {
+        category: req.category,
+        displayName: stripPrefix(req.category),
+        status: hit ? "addressed" : isUnscheduled ? "unscheduled" : "unaddressed",
+        courseCode: hit ? `${hit.subject} ${hit.number}` : undefined,
+        semester: hit ? hit.termLabel : undefined,
+      };
+    });
 }
 
-// ---------------------------------------------------------------------------
-// Plan explanation component
-// ---------------------------------------------------------------------------
-
-function PlanExplanation({
-  sessionToken,
-  onComplete,
-  savedExplanation,
-}: {
-  sessionToken: string;
-  onComplete: () => void;
-  savedExplanation?: string;
-}) {
-  const [text, setText] = useState(savedExplanation ?? "");
-  const [done, setDone] = useState(!!savedExplanation);
-  const fullTextRef = useRef(savedExplanation ?? "");
-
-  useEffect(() => {
-    if (savedExplanation) {
-      onComplete();
-      return;
-    }
-
-    const controller = new AbortController();
-    (async () => {
-      try {
-        for await (const chunk of streamPlanExplanation(sessionToken, controller.signal)) {
-          fullTextRef.current += chunk;
-          setText((prev) => prev + chunk);
-        }
-        onComplete();
-        saveExplanation(sessionToken, fullTextRef.current).catch(() => {});
-      } catch (err: any) {
-        if (err.name !== "AbortError") {
-          setText("Unable to load plan explanation.");
-          onComplete();
-        }
-      } finally {
-        setDone(true);
-      }
-    })();
-    return () => controller.abort();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionToken, savedExplanation]);
-
-  if (!text) {
-    return (
-      <div className="px-6 py-4 space-y-2.5 animate-pulse">
-        {[3 / 4, 1, 5 / 6, 1, 2 / 3].map((w, i) => (
-          <div key={i} className="h-3.5 bg-gray-200 rounded" style={{ width: `${w * 100}%` }} />
+function RequirementsCoverageCard({ items }: { items: RequirementCoverageItem[] }) {
+  return (
+    <div className="bg-white rounded-xl border border-gray-100 p-4 shadow-sm min-w-[240px]">
+      <p className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-3">
+        Requirements at a Glance
+      </p>
+      <div className="space-y-2">
+        {items.map((item, idx) => (
+          <div key={idx} className="flex items-center gap-2">
+            <span
+              className={`text-sm shrink-0 ${
+                item.status === "addressed"
+                  ? "text-green-500"
+                  : item.status === "unscheduled"
+                  ? "text-amber-500"
+                  : "text-gray-300"
+              }`}
+            >
+              {item.status === "addressed" ? "✓" : item.status === "unscheduled" ? "⚠" : "○"}
+            </span>
+            <span className="text-sm text-gray-700 flex-1 min-w-0 truncate leading-snug">
+              {item.displayName}
+            </span>
+            {item.courseCode && (
+              <span className="text-[11px] font-mono text-gray-400 shrink-0">
+                {item.courseCode}
+              </span>
+            )}
+            {item.semester && (
+              <span className="text-[11px] text-gray-400 shrink-0 ml-1">
+                {item.semester}
+              </span>
+            )}
+          </div>
         ))}
       </div>
-    );
-  }
-
-  return (
-    <div className="px-6 py-4">
-      <p className="text-[15px] text-gray-700 leading-[1.65] whitespace-pre-wrap">{text}</p>
-      {done && (
-        <p className="mt-4 text-[11px] text-gray-300 flex items-center gap-1.5">
-          <span className="text-green-400">✓</span> Analysis complete
-        </p>
-      )}
     </div>
   );
 }
@@ -593,20 +529,30 @@ function PlanExplanation({
 interface Message {
   role: "user" | "assistant";
   content: string;
+  type: "text" | "requirements_coverage";
+  requirementsData?: RequirementCoverageItem[];
   timestamp: Date;
 }
 
 function AdvisorChat({
   sessionToken,
-  explanationDone,
+  plan,
+  parsedData,
   savedMessages,
 }: {
   sessionToken: string;
-  explanationDone: boolean;
+  plan: Plan;
+  parsedData: ParsedAPAS;
   savedMessages?: SavedMessage[];
 }) {
   const [messages, setMessages] = useState<Message[]>(() =>
-    (savedMessages ?? []).map((m) => ({ ...m, timestamp: new Date(m.timestamp) }))
+    (savedMessages ?? []).map((m) => ({
+      role: m.role,
+      content: m.content,
+      type: m.type ?? "text",
+      requirementsData: m.requirementsData,
+      timestamp: new Date(m.timestamp),
+    }))
   );
   const [input, setInput] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
@@ -615,12 +561,12 @@ function AdvisorChat({
   const messagesRef = useRef<Message[]>(messages);
   const prevMsgCountRef = useRef(messages.length);
   const isInitialLoadRef = useRef(true);
-  const openingFiredRef = useRef((savedMessages?.length ?? 0) > 0);
+  const initFiredRef = useRef((savedMessages?.length ?? 0) > 0);
+  const initCompleteRef = useRef((savedMessages?.length ?? 0) > 0);
 
-  // Keep messagesRef in sync for use in effects
   useEffect(() => { messagesRef.current = messages; }, [messages]);
 
-  // Scroll behavior: instant on initial load / streaming updates, smooth for new messages
+  // Scroll: instant on initial load / streaming updates, smooth for new messages
   useEffect(() => {
     if (!messagesEndRef.current) return;
     const countIncreased = messages.length > prevMsgCountRef.current;
@@ -631,13 +577,20 @@ function AdvisorChat({
     if (isInitialLoadRef.current && messages.length > 0) isInitialLoadRef.current = false;
   }, [messages]);
 
-  // Save chat history whenever streaming stops (after a full exchange)
+  // Save chat history only after init sequence is fully complete
   const prevIsStreamingRef = useRef(false);
   useEffect(() => {
-    if (prevIsStreamingRef.current && !isStreaming && messagesRef.current.length > 0) {
+    if (
+      prevIsStreamingRef.current &&
+      !isStreaming &&
+      initCompleteRef.current &&
+      messagesRef.current.length > 0
+    ) {
       const serialized: SavedMessage[] = messagesRef.current.map((m) => ({
         role: m.role,
         content: m.content,
+        type: m.type,
+        requirementsData: m.requirementsData,
         timestamp: m.timestamp.toISOString(),
       }));
       saveChatHistory(sessionToken, serialized).catch(() => {});
@@ -645,32 +598,127 @@ function AdvisorChat({
     prevIsStreamingRef.current = isStreaming;
   }, [isStreaming, sessionToken]);
 
-  // Fire opening message 800ms after explanation finishes (skip if restoring)
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+  // Init sequence: explanation → requirements card → follow-up (skip on restore)
   useEffect(() => {
-    if (!explanationDone || openingFiredRef.current) return;
-    openingFiredRef.current = true;
-    const timer = setTimeout(() => sendMessage("", true), 800);
-    return () => clearTimeout(timer);
-  }, [explanationDone]);
+    if (initFiredRef.current) return;
+    initFiredRef.current = true;
 
-  async function sendMessage(userMessage: string, isOpening = false) {
-    if (isStreaming && !isOpening) return;
-    if (!userMessage.trim() && !isOpening) return;
+    const controller = new AbortController();
+    abortRef.current = controller;
 
-    const historySnapshot: ChatMessage[] = messages.map((m) => ({
+    (async () => {
+      const now = new Date();
+
+      // ── Step 1: Stream plan explanation ──
+      setIsStreaming(true);
+      setMessages([{ role: "assistant", content: "", type: "text", timestamp: now }]);
+
+      try {
+        for await (const chunk of streamPlanExplanation(sessionToken, controller.signal)) {
+          setMessages((prev) => {
+            const u = [...prev];
+            u[0] = { ...u[0], content: u[0].content + chunk };
+            return u;
+          });
+        }
+      } catch (err: any) {
+        if (err.name === "AbortError") { setIsStreaming(false); return; }
+        setMessages((prev) => {
+          const u = [...prev];
+          u[0] = { ...u[0], content: "Unable to load plan explanation." };
+          return u;
+        });
+      }
+
+      // ── 800ms pause ──
+      await new Promise((res) => setTimeout(res, 800));
+      if (controller.signal.aborted) { setIsStreaming(false); return; }
+
+      // ── Step 2: Requirements coverage card (instant) ──
+      const coverageData = computeRequirementsCoverage(parsedData, plan);
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          content: "",
+          type: "requirements_coverage",
+          requirementsData: coverageData,
+          timestamp: new Date(),
+        },
+      ]);
+
+      // ── 800ms pause ──
+      await new Promise((res) => setTimeout(res, 800));
+      if (controller.signal.aborted) { setIsStreaming(false); return; }
+
+      // ── Step 3: Stream follow-up ──
+      const historyForChat: ChatMessage[] = messagesRef.current.map((m) => ({
+        role: m.role,
+        content: m.content,
+      }));
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: "", type: "text", timestamp: new Date() },
+      ]);
+
+      try {
+        for await (const chunk of streamChat(
+          sessionToken,
+          "",
+          historyForChat,
+          true,
+          controller.signal
+        )) {
+          setMessages((prev) => {
+            const updated = [...prev];
+            updated[updated.length - 1] = {
+              ...updated[updated.length - 1],
+              content: updated[updated.length - 1].content + chunk,
+            };
+            return updated;
+          });
+        }
+      } catch (err: any) {
+        if (err.name !== "AbortError") {
+          setMessages((prev) => {
+            const updated = [...prev];
+            updated[updated.length - 1] = {
+              ...updated[updated.length - 1],
+              content: "Feel free to ask me anything about your plan!",
+            };
+            return updated;
+          });
+        }
+      } finally {
+        initCompleteRef.current = true;
+        setIsStreaming(false);
+        abortRef.current = null;
+      }
+    })();
+
+    return () => {
+      controller.abort();
+      initFiredRef.current = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function sendMessage(userMessage: string) {
+    if (isStreaming) return;
+    if (!userMessage.trim()) return;
+
+    const historySnapshot: ChatMessage[] = messagesRef.current.map((m) => ({
       role: m.role,
       content: m.content,
     }));
     const now = new Date();
 
     setIsStreaming(true);
-    if (!isOpening) setInput("");
-
+    setInput("");
     setMessages((prev) => [
       ...prev,
-      ...(isOpening ? [] : [{ role: "user" as const, content: userMessage, timestamp: now }]),
-      { role: "assistant" as const, content: "", timestamp: now },
+      { role: "user", content: userMessage, type: "text", timestamp: now },
+      { role: "assistant", content: "", type: "text", timestamp: now },
     ]);
 
     const controller = new AbortController();
@@ -681,7 +729,7 @@ function AdvisorChat({
         sessionToken,
         userMessage,
         historySnapshot,
-        isOpening,
+        false,
         controller.signal
       )) {
         setMessages((prev) => {
@@ -716,7 +764,7 @@ function AdvisorChat({
   return (
     <div className="flex flex-col flex-1 min-h-0">
       {/* Chat header */}
-      <div className="flex-none flex items-center gap-2.5 px-6 py-3 border-t border-b border-gray-100 bg-white">
+      <div className="flex-none flex items-center gap-2.5 px-6 py-3 border-b border-gray-100 bg-white">
         <span className="text-sm font-semibold text-gray-800">Your AI Advisor</span>
         <span
           className={`w-2 h-2 rounded-full animate-pulse ${
@@ -749,27 +797,35 @@ function AdvisorChat({
                 msg.role === "user" ? "items-end max-w-[75%]" : "items-start max-w-[85%]"
               }`}
             >
-              <div
-                className={`px-4 py-3 rounded-2xl text-sm leading-relaxed ${
-                  msg.role === "user"
-                    ? "bg-[#7A0019] text-white rounded-br-sm"
-                    : "bg-white border border-gray-200 text-gray-800 rounded-bl-sm shadow-sm"
-                }`}
-              >
-                {msg.content === "" && isStreaming && idx === messages.length - 1 ? (
-                  <span className="flex gap-1 py-0.5">
-                    {[0, 150, 300].map((delay) => (
-                      <span
-                        key={delay}
-                        className="w-1.5 h-1.5 bg-gray-300 rounded-full animate-bounce"
-                        style={{ animationDelay: `${delay}ms` }}
-                      />
-                    ))}
-                  </span>
-                ) : (
-                  msg.content
-                )}
-              </div>
+              {msg.type === "requirements_coverage" ? (
+                <div className="bg-gray-100 rounded-2xl rounded-bl-sm p-3">
+                  {msg.requirementsData && (
+                    <RequirementsCoverageCard items={msg.requirementsData} />
+                  )}
+                </div>
+              ) : (
+                <div
+                  className={`px-4 py-3 rounded-2xl text-sm leading-relaxed whitespace-pre-wrap ${
+                    msg.role === "user"
+                      ? "bg-[#7A0019] text-white rounded-br-sm"
+                      : "bg-white border border-gray-200 text-gray-800 rounded-bl-sm shadow-sm"
+                  }`}
+                >
+                  {msg.content === "" && isStreaming && idx === messages.length - 1 ? (
+                    <span className="flex gap-1 py-0.5">
+                      {[0, 150, 300].map((delay) => (
+                        <span
+                          key={delay}
+                          className="w-1.5 h-1.5 bg-gray-300 rounded-full animate-bounce"
+                          style={{ animationDelay: `${delay}ms` }}
+                        />
+                      ))}
+                    </span>
+                  ) : (
+                    msg.content
+                  )}
+                </div>
+              )}
               <span className="text-[10px] text-gray-300 px-1">
                 {formatTime(msg.timestamp)}
               </span>
@@ -824,18 +880,14 @@ function PlanStage({
   parsedData,
   plan,
   onReset,
-  savedExplanation,
   savedMessages,
 }: {
   sessionToken: string;
   parsedData: ParsedAPAS;
   plan: Plan;
   onReset: () => void;
-  savedExplanation?: string;
   savedMessages?: SavedMessage[];
 }) {
-  const [explanationDone, setExplanationDone] = useState(!!savedExplanation);
-
   const termColors: Record<string, string> = {
     F26: "bg-orange-50 border-orange-200",
     SP27: "bg-blue-50 border-blue-200",
@@ -947,34 +999,14 @@ function PlanStage({
               </div>
             </div>
           )}
-
-          {/* Requirements coverage */}
-          <RequirementsCoverage parsedData={parsedData} plan={plan} />
         </div>
 
-        {/* Right column — AI advisor (fixed height, flex column) */}
+        {/* Right column — AI advisor (full height flex column) */}
         <div className="w-2/5 flex flex-col h-full border-l border-gray-200 bg-white">
-
-          {/* Section label */}
-          <div className="flex-none px-6 pt-5 pb-2">
-            <span className="text-[11px] font-semibold tracking-[0.18em] text-gray-400 uppercase">
-              Your Advisor&apos;s Take
-            </span>
-          </div>
-
-          {/* Plan explanation — scrollable, capped at 40vh */}
-          <div className="flex-none max-h-[40vh] overflow-y-auto border-b border-gray-100">
-            <PlanExplanation
-              sessionToken={sessionToken}
-              onComplete={() => setExplanationDone(true)}
-              savedExplanation={savedExplanation}
-            />
-          </div>
-
-          {/* Chat — fills remaining space */}
           <AdvisorChat
             sessionToken={sessionToken}
-            explanationDone={explanationDone}
+            plan={plan}
+            parsedData={parsedData}
             savedMessages={savedMessages}
           />
         </div>
@@ -1016,7 +1048,6 @@ export default function Home() {
         sessionToken: token,
         parsedData: saved.parsed_apas,
         plan: saved.generated_plan,
-        savedExplanation: saved.plan_explanation ?? undefined,
         savedMessages: saved.chat_history.length > 0 ? saved.chat_history : undefined,
       });
     } catch {
@@ -1120,7 +1151,6 @@ export default function Home() {
         parsedData={state.parsedData}
         plan={state.plan}
         onReset={handleReset}
-        savedExplanation={state.savedExplanation}
         savedMessages={state.savedMessages}
       />
     );

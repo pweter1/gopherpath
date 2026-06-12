@@ -67,10 +67,20 @@ export interface ParsedAPAS {
   remaining_requirements: any[];
 }
 
+export interface RequirementCoverageItem {
+  category: string;
+  displayName: string;
+  status: "addressed" | "unscheduled" | "unaddressed";
+  courseCode?: string;
+  semester?: string;
+}
+
 export interface SavedMessage {
   role: "user" | "assistant";
   content: string;
   timestamp: string; // ISO string
+  type?: "text" | "requirements_coverage";
+  requirementsData?: RequirementCoverageItem[];
 }
 
 export interface SessionState {

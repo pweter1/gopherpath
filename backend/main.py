@@ -433,27 +433,6 @@ YOUR RULES:
 """
 
 
-_CLE_MAPPING = {
-    "Diversified Core - Biological & Physical Sciences":
-        ["Biological Sciences", "Physical Sciences"],
-    "Diversified Core - Historical Perspectives & Social Sciences":
-        ["Historical Perspectives", "Social Sciences"],
-    "Diversified Core - Arts/Humanities & Literature":
-        ["Arts/Humanities", "Literature"],
-    "Designated Themes - Civic Life and Ethics":
-        ["Civic Life and Ethics"],
-    "Designated Themes - Global Perspectives":
-        ["Global Perspectives"],
-    "Designated Themes - Technology and Society":
-        ["Technology and Society"],
-    "Designated Themes - The Environment":
-        ["The Environment"],
-    "Diversified Core - Mathematical Thinking":
-        ["Mathematical Thinking"],
-    "Designated Themes - Race, Power, and Justice":
-        ["Race Power and Justice"],
-}
-
 _SKIP_KEYWORDS = [
     "Minimum Degree Credits", "Minimum Major Credits", "Major GPA",
     "University Credit", "GPA Requirements", "S Grade Credit",
@@ -499,7 +478,7 @@ def _get_candidate_courses_for_chat(cursor, parsed_apas, generated_plan):
                 JOIN course_attributes ca ON c.id = ca.course_id
                 WHERE ca.attribute = 'WI' AND c.acad_career = 'UGRD'
                   AND c.credits IS NOT NULL
-                ORDER BY c.catalog_number ASC
+                ORDER BY c.catalog_number ASC, c.subject_code ASC, c.title ASC
                 LIMIT 200
             """)
             lines = [fmt_row(r) for r in cursor.fetchall()
@@ -508,8 +487,8 @@ def _get_candidate_courses_for_chat(cursor, parsed_apas, generated_plan):
                 sections.append(f"[{category}]\n" + "\n".join(lines))
             continue
 
-        cle_values = _CLE_MAPPING.get(category)
-        if not cle_values:
+        cle_values = match_le_category(category)
+        if not cle_values or cle_values == [None]:
             continue
 
         lines = []
@@ -522,7 +501,7 @@ def _get_candidate_courses_for_chat(cursor, parsed_apas, generated_plan):
                 WHERE ca.attribute = 'CLE' AND ca.value = %s
                   AND c.acad_career = 'UGRD'
                   AND c.credits IS NOT NULL AND c.credits <= 4
-                ORDER BY c.catalog_number ASC
+                ORDER BY c.catalog_number ASC, c.subject_code ASC, c.title ASC
                 LIMIT 200
             """, (cle_value,))
             for row in cursor.fetchall():
@@ -636,7 +615,7 @@ def plan_explanation_endpoint(session_token: str):
     return _stream_claude(system_prompt, [{"role": "user", "content": user_msg}])
 
 
-from backend.optimizer import optimize_plan
+from backend.optimizer import optimize_plan, match_le_category
 
 @app.post("/optimize/{session_token}")
 def optimize_plan_endpoint(session_token: str, preferences: Preferences):
@@ -671,12 +650,15 @@ def optimize_plan_endpoint(session_token: str, preferences: Preferences):
 
         plan = optimize_plan(parsed_apas, prefs)
 
-        # Save plan and preferences for chat context
+        # Save plan and preferences for chat context.
+        # Drop chat_history and plan_explanation: they describe the previous
+        # plan, and the frontend re-runs the advisor init sequence (explanation,
+        # requirements card, follow-up) when no saved messages exist.
         cursor.execute("""
             UPDATE students
             SET parsed_apas_json = jsonb_set(
                 jsonb_set(
-                    parsed_apas_json::jsonb,
+                    parsed_apas_json::jsonb - 'chat_history' - 'plan_explanation',
                     '{generated_plan}',
                     %s::jsonb
                 ),

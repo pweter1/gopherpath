@@ -167,6 +167,61 @@ def extract_simple_prereqs(subject, number):
 
     return unique
 
+# Map APAS requirement category names to our CLE attribute values
+LE_MAPPING = {
+    'Diversified Core - Biological & Physical Sciences': [
+        'Biological Sciences', 'Physical Sciences'
+    ],
+    'Diversified Core - Historical Perspectives & Social Sciences': [
+        'Historical Perspectives', 'Social Sciences'
+    ],
+    'Diversified Core - Arts/Humanities & Literature': [
+        'Arts/Humanities', 'Literature'
+    ],
+    'Designated Themes - Civic Life and Ethics': [
+        'Civic Life and Ethics'
+    ],
+    'Designated Themes - Global Perspectives': [
+        'Global Perspectives'
+    ],
+    'Designated Themes - Technology and Society': [
+        'Technology and Society'
+    ],
+    'Designated Themes - The Environment': [
+        'The Environment'
+    ],
+    'Diversified Core - Mathematical Thinking': [
+        'Mathematical Thinking'
+    ],
+    'Designated Themes - Race, Power, and Justice': [
+        'Race Power and Justice'
+    ],
+    'Writing Intensive': [None],  # handled separately via WI attribute
+}
+
+
+def match_le_category(requirement_category):
+    """
+    Maps an APAS requirement category to its CLE attribute values.
+
+    The Claude-based APAS parser is not consistent about parent-group
+    prefixes: the same requirement can parse as
+    'Diversified Core - Biological & Physical Sciences' in one upload and
+    'Liberal Education - Diversified Core - Biological & Physical Sciences'
+    in the next. Exact lookup first, then suffix match to absorb any prefix.
+
+    Returns the CLE value list, or None if the category isn't a Liberal Ed
+    requirement we can query.
+    """
+    values = LE_MAPPING.get(requirement_category)
+    if values:
+        return values
+    for key, vals in LE_MAPPING.items():
+        if requirement_category.endswith(key):
+            return vals
+    return None
+
+
 def recommend_courses_for_requirement(requirement_category, completed_courses, max_results=3, preferences=None, scheduled_codes=None):
     """
     Recommends real courses from the database for an open Liberal Ed
@@ -181,35 +236,6 @@ def recommend_courses_for_requirement(requirement_category, completed_courses, m
 
     Returns a list of course dicts ready to be added as candidates.
     """
-    # Map APAS requirement category names to our CLE attribute values
-    LE_MAPPING = {
-        'Diversified Core - Biological & Physical Sciences': [
-            'Biological Sciences', 'Physical Sciences'
-        ],
-        'Diversified Core - Historical Perspectives & Social Sciences': [
-            'Historical Perspectives', 'Social Sciences'
-        ],
-        'Diversified Core - Arts/Humanities & Literature': [
-            'Arts/Humanities', 'Literature'
-        ],
-        'Designated Themes - Civic Life and Ethics': [
-            'Civic Life and Ethics'
-        ],
-        'Designated Themes - Global Perspectives': [
-            'Global Perspectives'
-        ],
-        'Designated Themes - Technology and Society': [
-            'Technology and Society'
-        ],
-        'Designated Themes - The Environment': [
-            'The Environment'
-        ],
-        'Diversified Core - Mathematical Thinking': [
-            'Mathematical Thinking'
-        ],
-        'Writing Intensive': [None],  # handled separately via WI attribute
-    }
-
     # Build set of completed course codes for filtering
     completed_codes = {
         f"{c['subject']} {c['number']}"
@@ -228,14 +254,17 @@ def recommend_courses_for_requirement(requirement_category, completed_courses, m
     # difficulty="easy" or any other → lower numbers first (1xxx/2xxx)
     catalog_dir = "DESC" if difficulty == "hard" else "ASC"
     # timeline="asap" → prefer 3-credit courses so more fit per semester
+    # Tie-breakers (subject_code, title) make the ordering total — catalog
+    # numbers repeat across subjects, and Postgres returns tied rows in
+    # arbitrary order otherwise.
+    # safe: catalog_dir is only ever "ASC" or "DESC"
     if timeline == "asap":
-        # safe: catalog_dir is only ever "ASC" or "DESC"
-        order_clause = f"c.credits ASC, c.catalog_number {catalog_dir}"
+        order_clause = f"c.credits ASC, c.catalog_number {catalog_dir}, c.subject_code ASC, c.title ASC"
     else:
-        order_clause = f"c.catalog_number {catalog_dir}"
+        order_clause = f"c.catalog_number {catalog_dir}, c.subject_code ASC, c.title ASC"
 
     # Find which CLE values apply to this requirement
-    cle_values = LE_MAPPING.get(requirement_category)
+    cle_values = match_le_category(requirement_category)
     if not cle_values or cle_values == [None]:
         return []
 

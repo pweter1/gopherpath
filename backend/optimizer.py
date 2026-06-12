@@ -233,6 +233,19 @@ def min_credits_for_cle_value(cle_value):
     return MIN_LE_COURSE_CREDITS
 
 
+# Catalog-number suffixes marking enrollment-restricted sections: H = Honors,
+# V = Honors variant (honors + writing intensive). We don't track Honors
+# program membership, so candidate-selection queries never recommend these.
+# (W = writing intensive is NOT restricted and stays eligible.)
+RESTRICTED_SECTION_SUFFIXES = ("H", "V")
+RESTRICTED_SUFFIX_PATTERN = "[HV]$"  # SQL regex form, used with !~* (case-insensitive)
+
+
+def is_restricted_section(catalog_number):
+    """True for Honors/honors-variant catalog numbers (H or V suffix)."""
+    return catalog_number.upper().endswith(RESTRICTED_SECTION_SUFFIXES)
+
+
 # UMN writing requirement (onestop.umn.edu): four WI courses total, two of
 # them upper-division (3xxx+), one of those within the major. The APAS lists
 # the in-major upper-division WI as its own sub-requirement with explicit
@@ -297,6 +310,130 @@ def match_le_category(requirement_category):
     return None
 
 
+def _candidate_order_clause(preferences):
+    """
+    Deterministic ORDER BY for candidate queries, derived from preferences.
+
+    difficulty="hard" → higher catalog numbers first (4xxx/5xxx);
+    anything else → lower numbers first (1xxx/2xxx).
+    timeline="asap" → prefer fewer-credit courses so more fit per semester.
+    Tie-breakers (subject_code, title) make the ordering total — catalog
+    numbers repeat across subjects, and Postgres returns tied rows in
+    arbitrary order otherwise.
+    """
+    pref = preferences or {}
+    difficulty = pref.get("difficulty", "any")
+    timeline = pref.get("timeline", "on_time")
+    # safe: catalog_dir is only ever "ASC" or "DESC"
+    catalog_dir = "DESC" if difficulty == "hard" else "ASC"
+    if timeline == "asap":
+        return f"c.credits ASC, c.catalog_number {catalog_dir}, c.subject_code ASC, c.title ASC"
+    return f"c.catalog_number {catalog_dir}, c.subject_code ASC, c.title ASC"
+
+
+def recommend_multi_tag_courses(open_le_reqs, completed_courses, preferences=None, scheduled_codes=None):
+    """
+    Proactive "double-dip" pass: finds single courses whose CLE tags cover
+    TWO of the student's open Liberal Ed requirements at once, so one
+    course's credits satisfy two requirements.
+
+    UMN policy (curricularhub.umn.edu): a course may be approved to meet
+    "one Core or one Theme or both a Core and a Theme" — never two Cores or
+    two Themes — so only Core+Theme pairs are eligible.
+
+    open_le_reqs: ordered list of (requirement_category, cle_values) for the
+    student's open CLE-backed requirements.
+
+    Returns candidate dicts with satisfies_categories set to the two covered
+    requirement categories. Restricted to prereq-free courses for the same
+    reason as the WI recommendations: the scheduler doesn't know the prereq
+    chains of recommended courses.
+    """
+    if len(open_le_reqs) < 2:
+        return []
+
+    value_to_category = {}
+    for category, values in open_le_reqs:
+        for v in values:
+            value_to_category[v] = category
+
+    completed_codes = {
+        f"{c['subject']} {c['number']}"
+        for c in completed_courses
+        if not c.get('is_withdrawn')
+    }
+    already_scheduled = scheduled_codes or set()
+    order_clause = _candidate_order_clause(preferences)
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(f"""
+            SELECT c.subject_code, c.catalog_number, c.title, c.credits,
+                   c.offered_fall, c.offered_spring,
+                   array_agg(DISTINCT ca.value) AS matched_values
+            FROM courses c
+            JOIN course_attributes ca ON c.id = ca.course_id
+            WHERE ca.attribute = 'CLE'
+              AND ca.value = ANY(%s)
+              AND c.acad_career = 'UGRD'
+              AND c.credits IS NOT NULL
+              AND c.credits <= 4
+              AND c.catalog_number !~* '{RESTRICTED_SUFFIX_PATTERN}'
+              AND (c.prereq_raw IS NULL OR c.prereq_raw = '')
+            GROUP BY c.id, c.subject_code, c.catalog_number, c.title,
+                     c.credits, c.offered_fall, c.offered_spring
+            HAVING COUNT(DISTINCT ca.value) >= 2
+            ORDER BY {order_clause}
+        """, (list(value_to_category.keys()),))
+
+        results = []
+        for subject, number, title, credits, off_fall, off_spring, matched in cursor.fetchall():
+            code = f"{subject} {number}"
+            if code in completed_codes or code in already_scheduled:
+                continue
+            credits = float(credits)
+
+            # Categories this course can legitimately cover: the tag must map
+            # to an open requirement AND the course must meet that
+            # requirement's per-course credit minimum (4cr for bio/phys).
+            covered = []
+            for category, values in open_le_reqs:
+                if category in covered:
+                    continue
+                if any(v in matched and credits >= min_credits_for_cle_value(v)
+                       for v in values):
+                    covered.append(category)
+
+            cores = [cat for cat in covered if "Diversified Core" in cat]
+            themes = [cat for cat in covered if "Designated Themes" in cat]
+            if not cores or not themes:
+                continue
+            # Policy allows at most one Core + one Theme; pick the first of
+            # each in requirement order for determinism.
+            pair = [cores[0], themes[0]]
+
+            results.append({
+                "subject": subject,
+                "number": number,
+                "title": title,
+                "credits": credits,
+                "requirement_category": pair[0],
+                "satisfies_categories": pair,
+                "is_pinned": False,
+                "term_locked": None,
+                "offered_fall": off_fall,
+                "offered_spring": off_spring,
+                "prereqs": [],
+                "prereq_raw": "",
+                "cle_value": None,
+            })
+        return results
+    finally:
+        cursor.close()
+        conn.close()
+
+
 def recommend_courses_for_requirement(requirement_category, completed_courses, max_results=3, preferences=None, scheduled_codes=None):
     """
     Recommends real courses from the database for an open Liberal Ed
@@ -320,23 +457,7 @@ def recommend_courses_for_requirement(requirement_category, completed_courses, m
 
     already_scheduled = scheduled_codes or set()
 
-    # Determine ORDER BY from preferences
-    pref = preferences or {}
-    difficulty = pref.get("difficulty", "any")
-    timeline = pref.get("timeline", "on_time")
-
-    # difficulty="hard" → higher catalog numbers first (4xxx/5xxx)
-    # difficulty="easy" or any other → lower numbers first (1xxx/2xxx)
-    catalog_dir = "DESC" if difficulty == "hard" else "ASC"
-    # timeline="asap" → prefer 3-credit courses so more fit per semester
-    # Tie-breakers (subject_code, title) make the ordering total — catalog
-    # numbers repeat across subjects, and Postgres returns tied rows in
-    # arbitrary order otherwise.
-    # safe: catalog_dir is only ever "ASC" or "DESC"
-    if timeline == "asap":
-        order_clause = f"c.credits ASC, c.catalog_number {catalog_dir}, c.subject_code ASC, c.title ASC"
-    else:
-        order_clause = f"c.catalog_number {catalog_dir}, c.subject_code ASC, c.title ASC"
+    order_clause = _candidate_order_clause(preferences)
 
     # Find which CLE values apply to this requirement
     cle_values = match_le_category(requirement_category)
@@ -380,7 +501,7 @@ def recommend_courses_for_requirement(requirement_category, completed_courses, m
                   AND c.credits IS NOT NULL
                   AND c.credits <= 4
                   AND c.catalog_number >= '3000'
-                  AND c.catalog_number !~* 'H$'
+                  AND c.catalog_number !~* '{RESTRICTED_SUFFIX_PATTERN}'
                   AND (c.prereq_raw IS NULL OR c.prereq_raw = '')
                 ORDER BY {order_clause}
                 LIMIT 100
@@ -395,8 +516,6 @@ def recommend_courses_for_requirement(requirement_category, completed_courses, m
 
         results = []
         for cle_value in cle_values:
-            # catalog_number ending in H = Honors-restricted section; we don't
-            # track Honors program membership, so never recommend these.
             cursor.execute(f"""
                 SELECT DISTINCT c.subject_code, c.catalog_number, c.title,
                        c.credits, c.offered_fall, c.offered_spring
@@ -408,7 +527,7 @@ def recommend_courses_for_requirement(requirement_category, completed_courses, m
                   AND c.credits IS NOT NULL
                   AND c.credits >= %s
                   AND c.credits <= 4
-                  AND c.catalog_number !~* 'H$'
+                  AND c.catalog_number !~* '{RESTRICTED_SUFFIX_PATTERN}'
                 ORDER BY {order_clause}
                 LIMIT 100
             """, (cle_value, min_credits_for_cle_value(cle_value)))
@@ -544,7 +663,10 @@ def build_candidate_courses(parsed_apas, preferences=None):
             "prereq_raw": db_course["prereq_raw"] if db_course else "",
         })
 
-    # Process remaining requirements
+    # Phase 1: pinned requirements (explicit options lists). Open
+    # requirements are collected in order and handled in phases 2-3 below,
+    # so the double-dip pass can see the full pinned candidate pool.
+    open_requirements = []
     for req in parsed_apas.get("remaining_requirements", []):
         category = req["category"]
         options = req.get("options", [])
@@ -558,86 +680,121 @@ def build_candidate_courses(parsed_apas, preferences=None):
         if is_parent_header_requirement(req, parsed_apas.get("remaining_requirements", [])):
             continue
 
-        if options:
-            # Add enough courses from the options list to cover credits_needed.
-            # For single-course requirements (e.g. STAT 5102, credits_needed=4)
-            # this adds exactly 1 course and stops. For multi-credit requirements
-            # (e.g. Technical Electives, credits_needed=14) it adds ~4-5 courses.
-            credits_to_fill = float(credits_needed) if credits_needed else 0.0
-            added_this_req: set = set()
+        if not options:
+            open_requirements.append(req)
+            continue
 
-            for option in options:
-                # Stop once credits are covered (always add at least one course)
-                if credits_to_fill <= 0 and added_this_req:
-                    break
+        # Add enough courses from the options list to cover credits_needed.
+        # For single-course requirements (e.g. STAT 5102, credits_needed=4)
+        # this adds exactly 1 course and stops. For multi-credit requirements
+        # (e.g. Technical Electives, credits_needed=14) it adds ~4-5 courses.
+        credits_to_fill = float(credits_needed) if credits_needed else 0.0
+        added_this_req: set = set()
 
-                parts = option.strip().split()
-                if len(parts) < 2:
-                    continue
-                subject = parts[0]
-                number = " ".join(parts[1:])
-                code = f"{subject} {number}"
+        for option in options:
+            # Stop once credits are covered (always add at least one course)
+            if credits_to_fill <= 0 and added_this_req:
+                break
 
-                if code in in_progress or code in added_this_req:
-                    continue
+            parts = option.strip().split()
+            if len(parts) < 2:
+                continue
+            subject = parts[0]
+            number = " ".join(parts[1:])
+            code = f"{subject} {number}"
 
-                db_course = get_course_from_db(subject, number)
-                prereqs = extract_simple_prereqs(subject, number)
-                course_credits = db_course["credits"] if db_course else 3.0
+            if code in in_progress or code in added_this_req:
+                continue
 
-                candidates.append({
-                    "subject": subject,
-                    "number": number,
-                    "title": db_course["title"] if db_course else option,
-                    "credits": course_credits,
-                    "requirement_category": category,
-                    "is_pinned": True,
-                    "term_locked": None,
-                    "offered_fall": db_course["offered_fall"] if db_course else True,
-                    "offered_spring": db_course["offered_spring"] if db_course else True,
-                    "prereqs": prereqs,
-                    "prereq_raw": db_course["prereq_raw"] if db_course else "",
-                })
-                added_this_req.add(code)
-                credits_to_fill -= course_credits
-        else:
-            # Open requirement — recommend real courses from database,
-            # respecting difficulty/timeline preferences and avoiding
-            # courses already chosen for earlier requirements
-            already_added = {
-                f"{c['subject']} {c['number']}" for c in candidates
-            }
-            recommended = recommend_courses_for_requirement(
-                category,
-                parsed_apas.get("completed_courses", []),
-                preferences=preferences,
-                scheduled_codes=already_added,
+            db_course = get_course_from_db(subject, number)
+            prereqs = extract_simple_prereqs(subject, number)
+            course_credits = db_course["credits"] if db_course else 3.0
+
+            candidates.append({
+                "subject": subject,
+                "number": number,
+                "title": db_course["title"] if db_course else option,
+                "credits": course_credits,
+                "requirement_category": category,
+                "is_pinned": True,
+                "term_locked": None,
+                "offered_fall": db_course["offered_fall"] if db_course else True,
+                "offered_spring": db_course["offered_spring"] if db_course else True,
+                "prereqs": prereqs,
+                "prereq_raw": db_course["prereq_raw"] if db_course else "",
+            })
+            added_this_req.add(code)
+            credits_to_fill -= course_credits
+
+    # Phase 2: proactive double-dip across open Liberal Ed requirements.
+    # One course tagged for both an open Core and an open Theme satisfies
+    # two requirements with one course's credits, freeing schedule room.
+    completed = parsed_apas.get("completed_courses", [])
+    covered_by_multi = set()
+    cle_open = []
+    for req in open_requirements:
+        vals = match_le_category(req["category"])
+        if vals and vals != [None]:
+            cle_open.append((req["category"], vals))
+
+    if len(cle_open) >= 2:
+        already_added = {f"{c['subject']} {c['number']}" for c in candidates}
+        for cand in recommend_multi_tag_courses(
+            cle_open, completed, preferences=preferences,
+            scheduled_codes=already_added,
+        ):
+            # Accept only if it covers two still-uncovered requirements
+            new_cats = [cat for cat in cand["satisfies_categories"]
+                        if cat not in covered_by_multi]
+            if len(new_cats) < 2:
+                continue
+            candidates.append(cand)
+            covered_by_multi.update(new_cats)
+            already_added.add(f"{cand['subject']} {cand['number']}")
+
+    # Phase 3: remaining open requirements — recommend single courses,
+    # respecting difficulty/timeline preferences and avoiding courses
+    # already chosen for other requirements
+    for req in open_requirements:
+        category = req["category"]
+        credits_needed = req.get("credits_needed")
+        if category in covered_by_multi:
+            continue
+
+        already_added = {
+            f"{c['subject']} {c['number']}" for c in candidates
+        }
+        recommended = recommend_courses_for_requirement(
+            category,
+            completed,
+            preferences=preferences,
+            scheduled_codes=already_added,
+        )
+
+        if recommended:
+            # Most open requirements need a single course; the bare
+            # Writing Intensive parent requirement covers multiple
+            # remaining WI courses (see WI_ADDITIONAL_COURSES)
+            n_needed = (
+                WI_ADDITIONAL_COURSES
+                if is_wi_parent_requirement(category)
+                else 1
             )
-
-            if recommended:
-                # Most open requirements need a single course; the bare
-                # Writing Intensive parent requirement covers multiple
-                # remaining WI courses (see WI_ADDITIONAL_COURSES)
-                n_needed = (
-                    WI_ADDITIONAL_COURSES
-                    if is_wi_parent_requirement(category)
-                    else 1
-                )
-                candidates.extend(recommended[:n_needed])
-            elif credits_needed and credits_needed > 0:
-                # Fallback to placeholder if no recommendation found
-                candidates.append({
-                    "subject": "TBD",
-                    "number": "0000",
-                    "title": f"Course for: {category}",
-                    "credits": credits_needed,
-                    "requirement_category": category,
-                    "is_pinned": False,
-                    "term_locked": None,
-                    "offered_fall": True,
-                    "offered_spring": True,
-                    "prereqs": [],
-                })
+            candidates.extend(recommended[:n_needed])
+        elif credits_needed and credits_needed > 0:
+            # Fallback to placeholder if no recommendation found
+            candidates.append({
+                "subject": "TBD",
+                "number": "0000",
+                "title": f"Course for: {category}",
+                "credits": credits_needed,
+                "requirement_category": category,
+                "is_pinned": False,
+                "term_locked": None,
+                "offered_fall": True,
+                "offered_spring": True,
+                "prereqs": [],
+            })
 
     return candidates
 
@@ -777,6 +934,10 @@ def greedy_schedule(candidates, completed_courses, preferences=None):
         # Hard = prefer higher course numbers (4xxx/5xxx)
         def sort_key(c):
             is_pinned = not c["is_pinned"]
+            # Multi-tag (double-dip) candidates satisfy more requirements
+            # per credit — schedule them ahead of single-tag picks
+            coverage = -len(c.get("satisfies_categories")
+                            or [c["requirement_category"]])
             num = ''.join(filter(str.isdigit, c["number"]))
             level = int(num[0]) if num else 3
 
@@ -787,7 +948,7 @@ def greedy_schedule(candidates, completed_courses, preferences=None):
             else:
                 level_score = 0
 
-            return (is_pinned, level_score, -c["credits"])
+            return (is_pinned, coverage, level_score, -c["credits"])
 
         available.sort(key=sort_key)
 
@@ -815,12 +976,15 @@ def greedy_schedule(candidates, completed_courses, preferences=None):
 
     # Record every requirement category each course code can satisfy, so a
     # single scheduled course reflects all requirements it double-dips for.
+    # Candidates from the proactive multi-tag pass already carry their own
+    # satisfies_categories; merge those in too.
     code_to_categories = {}
     for c in candidates:
         code = f"{c['subject']} {c['number']}"
         cats = code_to_categories.setdefault(code, [])
-        if c["requirement_category"] not in cats:
-            cats.append(c["requirement_category"])
+        for cat in c.get("satisfies_categories") or [c["requirement_category"]]:
+            if cat not in cats:
+                cats.append(cat)
     for term_courses in plan.values():
         for c in term_courses:
             code = f"{c['subject']} {c['number']}"
@@ -992,6 +1156,9 @@ def optimize_plan(parsed_apas, preferences=None):
                 "number": c["number"],
                 "title": c["title"],
                 "requirement_category": c["requirement_category"],
+                "satisfies_categories": c.get(
+                    "satisfies_categories", [c["requirement_category"]]
+                ),
             }
             for c in unscheduled
         ],

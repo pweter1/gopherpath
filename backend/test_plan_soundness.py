@@ -23,7 +23,8 @@ optimize_plan) and asserts a checklist of soundness rules:
                               Physical Sciences (which also require a
                               lab/field component we cannot check from the
                               schema).
-  7. No Honors courses      — no scheduled catalog_number ending in 'H'
+  7. No restricted sections — no scheduled catalog_number ending in 'H' or
+                              'V' (Honors / honors-variant sections)
   8. Requirements coverage  — every non-meta remaining requirement is either
                               addressed by a scheduled course or listed in
                               unscheduled; nothing silently dropped
@@ -42,6 +43,7 @@ from optimizer import (  # noqa: E402
     extract_simple_prereqs,
     prereqs_satisfied,
     is_parent_header_requirement,
+    is_restricted_section,
     SKIP_META_KEYWORDS,
     MIN_LE_COURSE_CREDITS,
     MIN_BIO_PHYS_COURSE_CREDITS,
@@ -181,31 +183,33 @@ def run_checks(parsed_apas, result, max_credits_cap=DEFAULT_MAX_CREDITS):
                 ))
 
     # ── Rule 6: Liberal Ed credit minimums ───────────────────────────────
+    # A course must meet the minimum for EVERY LE category it claims to
+    # satisfy (double-dip courses claim two).
     for term, c in scheduled:
-        cat = c["requirement_category"]
         if c["subject"] == "TBD":
             continue
-        if "Designated Themes" not in cat and "Diversified Core" not in cat:
-            continue
-        min_credits = (
-            MIN_BIO_PHYS_COURSE_CREDITS
-            if "Biological & Physical Sciences" in cat
-            else MIN_LE_COURSE_CREDITS
-        )
-        if c["credits"] < min_credits:
-            failures.append((
-                "6 Liberal Ed credit minimums",
-                f"{c['subject']} {c['number']} ({c['credits']}cr) in "
-                f"{term['term_code']} for {cat!r} — below {min_credits}cr minimum"
-            ))
+        for cat in c.get("satisfies_categories", [c["requirement_category"]]):
+            if "Designated Themes" not in cat and "Diversified Core" not in cat:
+                continue
+            min_credits = (
+                MIN_BIO_PHYS_COURSE_CREDITS
+                if "Biological & Physical Sciences" in cat
+                else MIN_LE_COURSE_CREDITS
+            )
+            if c["credits"] < min_credits:
+                failures.append((
+                    "6 Liberal Ed credit minimums",
+                    f"{c['subject']} {c['number']} ({c['credits']}cr) in "
+                    f"{term['term_code']} for {cat!r} — below {min_credits}cr minimum"
+                ))
 
-    # ── Rule 7: no Honors courses ────────────────────────────────────────
+    # ── Rule 7: no restricted-section courses (Honors H/V suffixes) ─────
     for term, c in scheduled:
-        if c["subject"] != "TBD" and c["number"].upper().endswith("H"):
+        if c["subject"] != "TBD" and is_restricted_section(c["number"]):
             failures.append((
-                "7 No Honors courses",
+                "7 No restricted sections",
                 f"{c['subject']} {c['number']} ({c.get('title', '')!r}) in "
-                f"{term['term_code']} — Honors-restricted catalog number"
+                f"{term['term_code']} — restricted (Honors H/V) catalog number"
             ))
 
     # ── Rule 8: requirements coverage ────────────────────────────────────

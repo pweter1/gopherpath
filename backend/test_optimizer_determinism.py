@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from optimizer import (  # noqa: E402
     optimize_plan,
+    is_restricted_section,
     MIN_LE_COURSE_CREDITS,
     MIN_BIO_PHYS_COURSE_CREDITS,
 )
@@ -65,9 +66,9 @@ def check_le_eligibility(label, result):
             if not _is_liberal_ed(cat) or course["subject"] == "TBD":
                 continue
             code = f"{course['subject']} {course['number']}"
-            if course["number"].upper().endswith("H"):
+            if is_restricted_section(course["number"]):
                 failures.append(
-                    f"[{label}] HONORS-RESTRICTED: {code} recommended for {cat!r}"
+                    f"[{label}] RESTRICTED SECTION (H/V): {code} recommended for {cat!r}"
                 )
             min_credits = (
                 MIN_BIO_PHYS_COURSE_CREDITS
@@ -85,9 +86,9 @@ def check_le_eligibility(label, result):
         cat = course["requirement_category"]
         if not _is_liberal_ed(cat) or course["subject"] == "TBD":
             continue
-        if course["number"].upper().endswith("H"):
+        if is_restricted_section(course["number"]):
             failures.append(
-                f"[{label}] HONORS-RESTRICTED (unscheduled): "
+                f"[{label}] RESTRICTED SECTION (H/V, unscheduled): "
                 f"{course['subject']} {course['number']} for {cat!r}"
             )
     return failures

@@ -32,6 +32,12 @@ export interface TermPlan {
   total_credits: number;
 }
 
+export interface PreferenceData {
+  difficulty: string;
+  timeline: string;
+  freeText: string;
+}
+
 export interface Plan {
   status: string;
   plan: TermPlan[];
@@ -61,6 +67,52 @@ export interface ParsedAPAS {
   remaining_requirements: any[];
 }
 
+export interface SavedMessage {
+  role: "user" | "assistant";
+  content: string;
+  timestamp: string; // ISO string
+}
+
+export interface SessionState {
+  parsed_apas: ParsedAPAS;
+  generated_plan: Plan | null;
+  plan_explanation: string | null;
+  chat_history: SavedMessage[];
+}
+
+export async function loadSession(sessionToken: string): Promise<SessionState | null> {
+  const response = await fetch(`${API_BASE}/student/${sessionToken}`);
+  if (!response.ok) return null;
+  const result = await response.json();
+  const d = result.data;
+  if (!d.generated_plan) return null; // not yet optimized, don't restore
+  return {
+    parsed_apas: d.parsed_apas,
+    generated_plan: d.generated_plan,
+    plan_explanation: d.plan_explanation || null,
+    chat_history: d.chat_history || [],
+  };
+}
+
+export async function saveExplanation(sessionToken: string, explanation: string): Promise<void> {
+  await fetch(`${API_BASE}/save-explanation/${sessionToken}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ explanation }),
+  });
+}
+
+export async function saveChatHistory(
+  sessionToken: string,
+  messages: SavedMessage[]
+): Promise<void> {
+  await fetch(`${API_BASE}/chat-history/${sessionToken}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ messages }),
+  });
+}
+
 export async function parseAPAS(file: File): Promise<{
   session_token: string;
   data: ParsedAPAS;
@@ -82,8 +134,78 @@ export async function parseAPAS(file: File): Promise<{
   return result;
 }
 
-export async function optimizePlan(sessionToken: string): Promise<Plan> {
-  const response = await fetch(`${API_BASE}/optimize/${sessionToken}`);
+export interface ChatMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
+async function* _readSSEStream(
+  response: Response
+): AsyncGenerator<string> {
+  if (!response.body) throw new Error("No response body");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+      const data = line.slice(6).trim();
+      if (data === "[DONE]") return;
+      try {
+        const parsed = JSON.parse(data);
+        if (parsed.text) yield parsed.text;
+      } catch {}
+    }
+  }
+}
+
+export async function* streamChat(
+  sessionToken: string,
+  message: string,
+  history: ChatMessage[],
+  isOpening = false,
+  signal?: AbortSignal
+): AsyncGenerator<string> {
+  const response = await fetch(`${API_BASE}/chat/${sessionToken}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message, history, is_opening: isOpening }),
+    signal,
+  });
+  if (!response.ok) throw new Error("Chat request failed");
+  yield* _readSSEStream(response);
+}
+
+export async function* streamPlanExplanation(
+  sessionToken: string,
+  signal?: AbortSignal
+): AsyncGenerator<string> {
+  const response = await fetch(`${API_BASE}/plan-explanation/${sessionToken}`, {
+    signal,
+  });
+  if (!response.ok) throw new Error("Plan explanation request failed");
+  yield* _readSSEStream(response);
+}
+
+export async function optimizePlan(
+  sessionToken: string,
+  preferences: PreferenceData
+): Promise<Plan> {
+  const response = await fetch(`${API_BASE}/optimize/${sessionToken}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      difficulty: preferences.difficulty,
+      timeline: preferences.timeline,
+      free_text: preferences.freeText,
+    }),
+  });
 
   if (!response.ok) {
     const error = await response.json();
@@ -91,5 +213,5 @@ export async function optimizePlan(sessionToken: string): Promise<Plan> {
   }
 
   const result = await response.json();
-  return result.plan;
+  return result.plan.plan ? result.plan : result.plan;
 }

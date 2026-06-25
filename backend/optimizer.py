@@ -30,6 +30,14 @@ import anthropic
 from dotenv import load_dotenv
 from ortools.sat.python import cp_model
 
+# Policy values live in umn_policy.json (loaded via policy.py). optimizer.py is
+# imported both as `backend.optimizer` (from main.py) and as `optimizer` (from
+# tests with backend/ on sys.path), so try both import paths.
+try:
+    from backend.policy import POLICY
+except ImportError:
+    from policy import POLICY
+
 load_dotenv()
 
 # ---------------------------------------------------------------------------
@@ -49,7 +57,7 @@ TERMS = [
 # Seasons, ordered chronologically within a calendar year. Combined into a
 # single monotonic index (year*3 + season) so terms can be stepped/compared.
 _SEASON_SPRING, _SEASON_SUMMER, _SEASON_FALL = 0, 1, 2
-MAX_PLAN_TERMS = 8  # cap a plan at 4 years; longer implies bad input
+MAX_PLAN_TERMS = POLICY["scheduling"]["max_terms"]  # cap a plan at 4 years
 
 
 def _term_index(year, season):
@@ -174,25 +182,18 @@ COURSE_ALIASES = {
     "CSCI 4061":  "CSCI 3061",  # old number for Computer Systems
 }
 
-DEFAULT_MAX_CREDITS = 16
-DEFAULT_MIN_CREDITS = 12
+DEFAULT_MAX_CREDITS = POLICY["scheduling"]["default_max_credits"]
+DEFAULT_MIN_CREDITS = POLICY["scheduling"]["default_min_credits"]
 # timeline="asap" raises the per-semester cap so more courses fit each term
 # (mirrors the value main.py's /optimize endpoint passes for asap)
-ASAP_MAX_CREDITS = 18
+ASAP_MAX_CREDITS = POLICY["scheduling"]["asap_max_credits"]
+
+# Largest course credit value eligible for recommendation
+MAX_RECOMMENDED_CREDITS = POLICY["course_filters"]["max_recommended_credits"]
 
 # Meta-requirements (total credit counts, GPA requirements) — these are
 # degree-level checks, not schedulable courses
-SKIP_META_KEYWORDS = [
-    "Minimum Degree Credits",
-    "Minimum Major Credits",
-    "Major GPA",
-    "University Credit",
-    "GPA Requirements",
-    "S Grade Credit",
-    "Credits Completed",
-    "Degree-Applicable",
-    "Elective Credits",
-]
+SKIP_META_KEYWORDS = POLICY["meta_requirement_keywords"]
 
 
 # ---------------------------------------------------------------------------
@@ -304,52 +305,30 @@ def extract_simple_prereqs(subject, number):
 
     return unique
 
-# Map APAS requirement category names to our CLE attribute values
-LE_MAPPING = {
-    'Diversified Core - Biological & Physical Sciences': [
-        'Biological Sciences', 'Physical Sciences'
-    ],
-    'Diversified Core - Historical Perspectives & Social Sciences': [
-        'Historical Perspectives', 'Social Sciences'
-    ],
-    'Diversified Core - Arts/Humanities & Literature': [
-        'Arts/Humanities', 'Literature'
-    ],
-    'Designated Themes - Civic Life and Ethics': [
-        'Civic Life and Ethics'
-    ],
-    'Designated Themes - Global Perspectives': [
-        'Global Perspectives'
-    ],
-    'Designated Themes - Technology and Society': [
-        'Technology and Society'
-    ],
-    'Designated Themes - The Environment': [
-        'The Environment'
-    ],
-    'Diversified Core - Mathematical Thinking': [
-        'Mathematical Thinking'
-    ],
-    'Designated Themes - Race, Power, and Justice': [
-        'Race Power and Justice'
-    ],
-    'Writing Intensive': [None],  # handled separately via WI attribute
-}
+# Map APAS requirement category names to our CLE attribute values.
+# 'Writing Intensive' maps to [None] (JSON null) — handled separately via the
+# WI attribute. Insertion order is preserved by json.load and matters for the
+# suffix-matching in match_le_category().
+LE_MAPPING = POLICY["liberal_education"]["requirement_mapping"]
 
 # UMN Liberal Education guidelines (curricularhub.umn.edu): a course must
 # "be at least 3 credits (or at least 4 credits for biological or physical
 # sciences, which must include a lab or field experience component)" to
 # carry an LE designation. Recommending below-threshold courses would tell
 # students a requirement is satisfied when it isn't.
-MIN_LE_COURSE_CREDITS = 3.0
-MIN_BIO_PHYS_COURSE_CREDITS = 4.0
-BIO_PHYS_CLE_VALUES = {"Biological Sciences", "Physical Sciences"}
+MIN_LE_COURSE_CREDITS = POLICY["liberal_education"]["default_min_credits"]
+MIN_BIO_PHYS_COURSE_CREDITS = (
+    POLICY["liberal_education"]["categories"]["Biological Sciences"]["min_credits"]
+)
+# CLE values with a category-specific credit minimum (e.g. bio/phys = 4cr)
+BIO_PHYS_CLE_VALUES = set(POLICY["liberal_education"]["categories"].keys())
 
 
 def min_credits_for_cle_value(cle_value):
     """Per-course credit minimum for a CLE attribute value."""
-    if cle_value in BIO_PHYS_CLE_VALUES:
-        return MIN_BIO_PHYS_COURSE_CREDITS
+    category = POLICY["liberal_education"]["categories"].get(cle_value)
+    if category:
+        return category["min_credits"]
     return MIN_LE_COURSE_CREDITS
 
 
@@ -357,8 +336,9 @@ def min_credits_for_cle_value(cle_value):
 # V = Honors variant (honors + writing intensive). We don't track Honors
 # program membership, so candidate-selection queries never recommend these.
 # (W = writing intensive is NOT restricted and stays eligible.)
-RESTRICTED_SECTION_SUFFIXES = ("H", "V")
-RESTRICTED_SUFFIX_PATTERN = "[HV]$"  # SQL regex form, used with !~* (case-insensitive)
+RESTRICTED_SECTION_SUFFIXES = tuple(POLICY["course_filters"]["restricted_section_suffixes"])
+# SQL regex form, used with !~* (case-insensitive)
+RESTRICTED_SUFFIX_PATTERN = POLICY["course_filters"]["restricted_section_sql_pattern"]
 
 
 def is_restricted_section(catalog_number):
@@ -371,17 +351,16 @@ def is_restricted_section(catalog_number):
 # never recommended (same spirit as RESTRICTED_SECTION_SUFFIXES). Filtered by
 # title because catalog-number conventions vary by department (x793, x794,
 # x993, x994, 4094, ...). SQL regex form, used with !~* (case-insensitive).
-DIRECTED_STUDY_TITLE_PATTERN = (
-    "(directed stud|directed research|directed reading"
-    "|independent stud|individual stud)"
-)
+DIRECTED_STUDY_TITLE_PATTERN = POLICY["course_filters"]["directed_study_title_pattern"]
 
 # Quality floor for recommended Writing Intensive courses. UMN publishes no
 # per-course WI credit minimum (unlike the Liberal Ed 3/4cr rule), but the
 # norm is clear: 453 of 491 upper-division WI courses are 3+ credits, and the
 # sub-3cr ones are mostly directed studies/seminars. Norm-based assumption —
 # revisit if a real policy minimum surfaces.
-MIN_WI_CREDITS = 3.0
+MIN_WI_CREDITS = POLICY["writing_intensive"]["min_course_credits"]
+# WI upper-division catalog-number threshold (3xxx and above)
+WI_UPPER_DIVISION_THRESHOLD = POLICY["writing_intensive"]["upper_division_threshold"]
 
 
 # UMN writing requirement (onestop.umn.edu): four WI courses total, two of
@@ -389,11 +368,11 @@ MIN_WI_CREDITS = 3.0
 # the in-major upper-division WI as its own sub-requirement with explicit
 # course options; the bare parent "Writing Intensive" row carries no credit
 # count, so we schedule this many additional upper-division WI courses for it.
-WI_ADDITIONAL_COURSES = 2
+WI_ADDITIONAL_COURSES = POLICY["writing_intensive"]["additional_courses_to_schedule"]
 
 # Courses UMN designates as counting double toward the WI total.
 # Source: UMN APAS audit — "WRIT 3562W counts as 2 upper-division WI courses."
-DOUBLE_COUNT_WI_COURSES = {"WRIT 3562W"}
+DOUBLE_COUNT_WI_COURSES = set(POLICY["writing_intensive"]["double_count_courses"].keys())
 
 
 def is_wi_parent_requirement(category):
@@ -520,7 +499,7 @@ def recommend_multi_tag_courses(open_le_reqs, completed_courses, preferences=Non
               AND ca.value = ANY(%s)
               AND c.acad_career = 'UGRD'
               AND c.credits IS NOT NULL
-              AND c.credits <= 4
+              AND c.credits <= {MAX_RECOMMENDED_CREDITS}
               AND c.catalog_number !~* '{RESTRICTED_SUFFIX_PATTERN}'
               AND c.title !~* '{DIRECTED_STUDY_TITLE_PATTERN}'
               AND (c.prereq_raw IS NULL OR c.prereq_raw = '')
@@ -643,8 +622,8 @@ def recommend_courses_for_requirement(requirement_category, completed_courses, m
                   AND c.acad_career = 'UGRD'
                   AND c.credits IS NOT NULL
                   AND c.credits >= %s
-                  AND c.credits <= 4
-                  AND c.catalog_number >= '3000'
+                  AND c.credits <= {MAX_RECOMMENDED_CREDITS}
+                  AND c.catalog_number >= '{WI_UPPER_DIVISION_THRESHOLD}'
                   AND c.catalog_number !~* '{RESTRICTED_SUFFIX_PATTERN}'
                   AND c.title !~* '{DIRECTED_STUDY_TITLE_PATTERN}'
                   AND (c.prereq_raw IS NULL OR c.prereq_raw = '')
@@ -671,7 +650,7 @@ def recommend_courses_for_requirement(requirement_category, completed_courses, m
                   AND c.acad_career = 'UGRD'
                   AND c.credits IS NOT NULL
                   AND c.credits >= %s
-                  AND c.credits <= 4
+                  AND c.credits <= {MAX_RECOMMENDED_CREDITS}
                   AND c.catalog_number !~* '{RESTRICTED_SUFFIX_PATTERN}'
                   AND c.title !~* '{DIRECTED_STUDY_TITLE_PATTERN}'
                 ORDER BY {order_clause}

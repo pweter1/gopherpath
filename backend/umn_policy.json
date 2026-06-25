@@ -1,0 +1,64 @@
+{
+  "_comment": "UMN academic policy rules for GopherPath optimizer. Sources listed per rule.",
+
+  "writing_intensive": {
+    "_source": "https://onestop.umn.edu/academics/undergraduate/lib-ed-requirements-overview/writing-requirement",
+    "total_required": 4,
+    "min_upper_division": 2,
+    "upper_division_threshold": "3000",
+    "additional_courses_to_schedule": 2,
+    "min_course_credits": 3.0,
+    "double_count_courses": {
+      "WRIT 3562W": 2
+    }
+  },
+
+  "liberal_education": {
+    "_source": "https://curricularhub.umn.edu undergraduate Liberal Education Guidelines",
+    "default_min_credits": 3.0,
+    "categories": {
+      "Biological Sciences": {"min_credits": 4.0},
+      "Physical Sciences": {"min_credits": 4.0}
+    },
+    "core_theme_pairing_rule": "A course may satisfy at most one Core and one Theme — never two Cores or two Themes.",
+    "requirement_mapping": {
+      "Diversified Core - Biological & Physical Sciences": ["Biological Sciences", "Physical Sciences"],
+      "Diversified Core - Historical Perspectives & Social Sciences": ["Historical Perspectives", "Social Sciences"],
+      "Diversified Core - Arts/Humanities & Literature": ["Arts/Humanities", "Literature"],
+      "Designated Themes - Civic Life and Ethics": ["Civic Life and Ethics"],
+      "Designated Themes - Global Perspectives": ["Global Perspectives"],
+      "Designated Themes - Technology and Society": ["Technology and Society"],
+      "Designated Themes - The Environment": ["The Environment"],
+      "Diversified Core - Mathematical Thinking": ["Mathematical Thinking"],
+      "Designated Themes - Race, Power, and Justice": ["Race Power and Justice"],
+      "Writing Intensive": [null]
+    }
+  },
+
+  "scheduling": {
+    "default_max_credits": 16,
+    "asap_max_credits": 18,
+    "default_min_credits": 12,
+    "max_terms": 8
+  },
+
+  "course_filters": {
+    "_comment": "Patterns for courses to exclude from recommendations",
+    "restricted_section_suffixes": ["H", "V"],
+    "restricted_section_sql_pattern": "[HV]$",
+    "directed_study_title_pattern": "(directed stud|directed research|directed reading|independent stud|individual stud)",
+    "max_recommended_credits": 4
+  },
+
+  "meta_requirement_keywords": [
+    "Minimum Degree Credits",
+    "Minimum Major Credits",
+    "Major GPA",
+    "University Credit",
+    "GPA Requirements",
+    "S Grade Credit",
+    "Credits Completed",
+    "Degree-Applicable",
+    "Elective Credits"
+  ]
+}

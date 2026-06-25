@@ -25,6 +25,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+try:
+    from backend.policy import POLICY
+except ImportError:
+    from policy import POLICY
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from scrapers.parse_apas import parse_apas, validate_parsed_apas
 
@@ -433,11 +438,7 @@ YOUR RULES:
 """
 
 
-_SKIP_KEYWORDS = [
-    "Minimum Degree Credits", "Minimum Major Credits", "Major GPA",
-    "University Credit", "GPA Requirements", "S Grade Credit",
-    "Credits Completed", "Degree-Applicable", "Elective Credits",
-]
+_SKIP_KEYWORDS = POLICY["meta_requirement_keywords"]
 
 
 def _get_candidate_courses_for_chat(cursor, parsed_apas, generated_plan):
@@ -510,7 +511,7 @@ def _get_candidate_courses_for_chat(cursor, parsed_apas, generated_plan):
                   AND c.acad_career = 'UGRD'
                   AND c.credits IS NOT NULL
                   AND c.credits >= %s
-                  AND c.credits <= 4
+                  AND c.credits <= {POLICY["course_filters"]["max_recommended_credits"]}
                   AND c.catalog_number !~* '{RESTRICTED_SUFFIX_PATTERN}'
                   AND c.title !~* '{DIRECTED_STUDY_TITLE_PATTERN}'
                 ORDER BY c.catalog_number ASC, c.subject_code ASC, c.title ASC
@@ -662,7 +663,9 @@ def optimize_plan_endpoint(session_token: str, preferences: Preferences):
             "difficulty": preferences.difficulty,
             "timeline": preferences.timeline,
             "max_credits_per_semester": preferences.max_credits or (
-                18 if preferences.timeline == "asap" else 16
+                POLICY["scheduling"]["asap_max_credits"]
+                if preferences.timeline == "asap"
+                else POLICY["scheduling"]["default_max_credits"]
             ),
             "free_text": preferences.free_text,
         }

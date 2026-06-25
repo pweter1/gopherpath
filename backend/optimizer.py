@@ -271,6 +271,10 @@ MIN_WI_CREDITS = 3.0
 # count, so we schedule this many additional upper-division WI courses for it.
 WI_ADDITIONAL_COURSES = 2
 
+# Courses UMN designates as counting double toward the WI total.
+# Source: UMN APAS audit — "WRIT 3562W counts as 2 upper-division WI courses."
+DOUBLE_COUNT_WI_COURSES = {"WRIT 3562W"}
+
 
 def is_wi_parent_requirement(category):
     """
@@ -725,6 +729,9 @@ def build_candidate_courses(parsed_apas, preferences=None):
             number = " ".join(parts[1:])
             code = f"{subject} {number}"
 
+            if is_restricted_section(number):
+                continue  # skip Honors/honors-variant sections in requirements options lists
+
             if code in in_progress or code in added_this_req:
                 continue
 
@@ -796,12 +803,18 @@ def build_candidate_courses(parsed_apas, preferences=None):
         if recommended:
             # Most open requirements need a single course; the bare
             # Writing Intensive parent requirement covers multiple
-            # remaining WI courses (see WI_ADDITIONAL_COURSES)
-            n_needed = (
-                WI_ADDITIONAL_COURSES
-                if is_wi_parent_requirement(category)
-                else 1
-            )
+            # remaining WI courses (see WI_ADDITIONAL_COURSES). But a
+            # double-counting WI course already in the plan (e.g.
+            # WRIT 3562W counts as 2) reduces the additional courses needed.
+            if is_wi_parent_requirement(category):
+                added_codes = {f"{c['subject']} {c['number']}" for c in candidates}
+                n_needed = (
+                    1
+                    if added_codes & DOUBLE_COUNT_WI_COURSES
+                    else WI_ADDITIONAL_COURSES
+                )
+            else:
+                n_needed = 1
             candidates.extend(recommended[:n_needed])
         elif credits_needed and credits_needed > 0:
             # Fallback to placeholder if no recommendation found
@@ -1054,9 +1067,8 @@ def _reorder_candidates_by_free_text(candidates, free_text):
     try:
         client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
         response = client.messages.create(
-            model="claude-opus-4-8",
+            model="claude-sonnet-4-6",
             max_tokens=512,
-            thinking={"type": "adaptive"},
             messages=[{
                 "role": "user",
                 "content": (

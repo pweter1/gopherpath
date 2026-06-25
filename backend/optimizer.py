@@ -23,6 +23,7 @@ import os
 import re
 import sys
 import json
+import datetime
 import networkx as nx
 import psycopg2
 import anthropic
@@ -35,14 +36,133 @@ load_dotenv()
 # Constants
 # ---------------------------------------------------------------------------
 
-# Term codes map to human-readable labels and sequence numbers
-# Sequence number determines ordering (lower = earlier)
+# Fallback term list, used only when expected_graduation is missing or
+# unparseable. Normally optimize_plan() derives terms via build_terms().
+# Sequence number determines ordering (lower = earlier).
 TERMS = [
-    {"code": "F26",  "label": "Fall 2026",   "seq": 0, "is_fall": True},
-    {"code": "SP27", "label": "Spring 2027", "seq": 1, "is_fall": False},
-    {"code": "F27",  "label": "Fall 2027",   "seq": 2, "is_fall": True},
-    {"code": "SP28", "label": "Spring 2028", "seq": 3, "is_fall": False},
+    {"code": "F26",  "label": "Fall 2026",   "seq": 0, "is_fall": True,  "is_summer": False},
+    {"code": "SP27", "label": "Spring 2027", "seq": 1, "is_fall": False, "is_summer": False},
+    {"code": "F27",  "label": "Fall 2027",   "seq": 2, "is_fall": True,  "is_summer": False},
+    {"code": "SP28", "label": "Spring 2028", "seq": 3, "is_fall": False, "is_summer": False},
 ]
+
+# Seasons, ordered chronologically within a calendar year. Combined into a
+# single monotonic index (year*3 + season) so terms can be stepped/compared.
+_SEASON_SPRING, _SEASON_SUMMER, _SEASON_FALL = 0, 1, 2
+MAX_PLAN_TERMS = 8  # cap a plan at 4 years; longer implies bad input
+
+
+def _term_index(year, season):
+    return year * 3 + season
+
+
+def _season_for_month(month):
+    """UMN-ish term calendar: Jan-May spring, Jun-Aug summer, Sep-Dec fall."""
+    if month <= 5:
+        return _SEASON_SPRING
+    if month <= 8:
+        return _SEASON_SUMMER
+    return _SEASON_FALL
+
+
+def _parse_graduation(expected_graduation):
+    """
+    Parse an APAS expected_graduation string into (year, season), or None.
+
+    The Claude APAS parser is inconsistent: 'Spr 28', 'Spring 2028',
+    'Fall 2026', 'Sum 27' all occur. Match a season word + a 2- or 4-digit
+    year (2-digit assumed 20xx).
+    """
+    if not expected_graduation:
+        return None
+    m = re.search(r"([A-Za-z]+)\s*'?\s*(\d{2,4})", expected_graduation.strip())
+    if not m:
+        return None
+    word = m.group(1).lower()
+    year = int(m.group(2))
+    if year < 100:
+        year += 2000
+    if word.startswith("sp"):       # spr, spring
+        season = _SEASON_SPRING
+    elif word.startswith("su"):     # sum, summer
+        season = _SEASON_SUMMER
+    elif word.startswith("f"):      # fall, fal, f
+        season = _SEASON_FALL
+    else:
+        return None
+    return (year, season)
+
+
+def _make_term(idx, seq):
+    """Build a term dict from a monotonic term index and sequence number."""
+    year, season = divmod(idx, 3)
+    yy = year % 100
+    if season == _SEASON_FALL:
+        return {"code": f"F{yy:02d}", "label": f"Fall {year}", "seq": seq,
+                "is_fall": True, "is_summer": False}
+    if season == _SEASON_SPRING:
+        return {"code": f"SP{yy:02d}", "label": f"Spring {year}", "seq": seq,
+                "is_fall": False, "is_summer": False}
+    return {"code": f"SU{yy:02d}", "label": f"Summer {year}", "seq": seq,
+            "is_fall": False, "is_summer": True}
+
+
+def _regular_terms_from(start_idx, n):
+    """n consecutive Fall/Spring terms starting at start_idx (summers skipped)."""
+    terms, idx, seq = [], start_idx, 0
+    while len(terms) < n:
+        if idx % 3 != _SEASON_SUMMER:
+            terms.append(_make_term(idx, seq))
+            seq += 1
+        idx += 1
+    return terms
+
+
+def build_terms(expected_graduation, today=None):
+    """
+    Derive the plannable term list from a student's expected graduation.
+
+    Terms run from the next term after `today` up to and including the
+    graduation term. Regular plannable terms are Fall and Spring; summer
+    terms are skipped UNLESS summer is the graduation term itself. Capped at
+    MAX_PLAN_TERMS. Falls back gracefully (with a warning) on bad input.
+    """
+    today = today or datetime.date.today()
+    start_idx = _term_index(today.year, _season_for_month(today.month)) + 1
+    # Don't start a plan in summer — advance to the following fall.
+    if start_idx % 3 == _SEASON_SUMMER:
+        start_idx += 1
+
+    grad = _parse_graduation(expected_graduation)
+    if grad is None:
+        print(f"[optimizer] WARNING: unparseable expected_graduation "
+              f"{expected_graduation!r}; using fallback terms.", file=sys.stderr)
+        return [dict(t) for t in TERMS]
+
+    grad_idx = _term_index(*grad)
+    if grad_idx < start_idx:
+        print(f"[optimizer] WARNING: expected_graduation {expected_graduation!r} "
+              f"is already past; using 4-term fallback from current term.",
+              file=sys.stderr)
+        return _regular_terms_from(start_idx, 4)
+
+    terms, idx, seq = [], start_idx, 0
+    while idx <= grad_idx and len(terms) < MAX_PLAN_TERMS:
+        is_grad = (idx == grad_idx)
+        if idx % 3 == _SEASON_SUMMER and not is_grad:
+            idx += 1
+            continue
+        terms.append(_make_term(idx, seq))
+        seq += 1
+        idx += 1
+
+    if idx <= grad_idx:
+        print(f"[optimizer] WARNING: graduation {expected_graduation!r} is more "
+              f"than {MAX_PLAN_TERMS} terms away; capping plan length.",
+              file=sys.stderr)
+    if not terms:
+        return _regular_terms_from(start_idx, 4)
+    return terms
 
 # Course aliases — some courses appear under different numbers in prereq
 # text vs what students actually take. This mapping handles known cases.
@@ -652,7 +772,7 @@ class PrerequisiteGraph:
 # Course candidate builder
 # ---------------------------------------------------------------------------
 
-def build_candidate_courses(parsed_apas, preferences=None):
+def build_candidate_courses(parsed_apas, preferences=None, terms=None):
     """
     Builds the list of courses the optimizer needs to schedule.
 
@@ -668,11 +788,15 @@ def build_candidate_courses(parsed_apas, preferences=None):
       - term_locked (term code if already scheduled, else None)
       - prereq_raw (raw prereq text, used for AND/OR logic in greedy_schedule)
     """
+    if terms is None:
+        terms = TERMS
+    first_term_code = terms[0]["code"]
+
     candidates = []
     in_progress = {f"{c['subject']} {c['number']}"
                    for c in parsed_apas.get("in_progress_courses", [])}
 
-    # Add in-progress courses as locked to F26
+    # Add in-progress courses as locked to the first plannable term
     for course in parsed_apas.get("in_progress_courses", []):
         db_course = get_course_from_db(course["subject"], course["number"])
         candidates.append({
@@ -682,7 +806,7 @@ def build_candidate_courses(parsed_apas, preferences=None):
             "credits": course.get("credits", 3.0),
             "requirement_category": "In Progress",
             "is_pinned": True,
-            "term_locked": "F26",
+            "term_locked": first_term_code,
             "offered_fall": True,
             "offered_spring": True,
             "prereqs": [],
@@ -749,6 +873,7 @@ def build_candidate_courses(parsed_apas, preferences=None):
                 "term_locked": None,
                 "offered_fall": db_course["offered_fall"] if db_course else True,
                 "offered_spring": db_course["offered_spring"] if db_course else True,
+                "offered_summer": db_course["offered_summer"] if db_course else True,
                 "prereqs": prereqs,
                 "prereq_raw": db_course["prereq_raw"] if db_course else "",
             })
@@ -862,7 +987,7 @@ def prereqs_satisfied(prereqs, prereq_raw, satisfied):
     return any(prereq in satisfied for prereq in resolved)
 
 
-def greedy_schedule(candidates, completed_courses, preferences=None):
+def greedy_schedule(candidates, completed_courses, preferences=None, terms=None):
     """
     Assigns courses to semesters using a greedy algorithm.
 
@@ -871,7 +996,7 @@ def greedy_schedule(candidates, completed_courses, preferences=None):
     this for the full optimizer once the data model is solid.
 
     Algorithm:
-      1. Lock in-progress courses to F26
+      1. Lock in-progress courses to the first term
       2. For each remaining term, fill up to max_credits with
          courses that are available (prereqs satisfied) and
          offered in that term
@@ -882,6 +1007,9 @@ def greedy_schedule(candidates, completed_courses, preferences=None):
     """
     if preferences is None:
         preferences = {}
+    if terms is None:
+        terms = TERMS
+    first_term_code = terms[0]["code"]
 
     difficulty = preferences.get("difficulty", "any")
     timeline = preferences.get("timeline", "on_time")
@@ -907,7 +1035,7 @@ def greedy_schedule(candidates, completed_courses, preferences=None):
         code = f"{c['subject']} {c['number']}"
         candidate_map[code] = c
 
-    plan = {term["code"]: [] for term in TERMS}
+    plan = {term["code"]: [] for term in terms}
     # Initialize scheduled with all completed courses
     # so prereq checks correctly recognize already-finished coursework
     scheduled = set()
@@ -916,21 +1044,21 @@ def greedy_schedule(candidates, completed_courses, preferences=None):
             code = f"{course['subject']} {course['number']}"
             scheduled.add(code)
 
-    # First pass: lock in-progress courses to F26
+    # First pass: lock in-progress courses to the first term.
     # Note: in-progress courses are added to the plan but NOT to scheduled yet.
     # This prevents other courses from treating them as completed prerequisites
-    # in the same term. They get added to scheduled after F26 is processed.
+    # in the same term. They get added to scheduled after the first term is done.
     in_progress_codes = set()
     for c in candidates:
-        if c.get("term_locked") == "F26":
-            plan["F26"].append(c)
+        if c.get("term_locked") == first_term_code:
+            plan[first_term_code].append(c)
             in_progress_codes.add(f"{c['subject']} {c['number']}")
 
     # Second pass: schedule remaining courses greedily
-    for term in TERMS:
-        if term["code"] == "F26":
+    for term in terms:
+        if term["code"] == first_term_code:
             # Already handled in-progress, but can add more
-            current_credits = sum(c["credits"] for c in plan["F26"])
+            current_credits = sum(c["credits"] for c in plan[first_term_code])
             scheduled.update(in_progress_codes)
         else:
             current_credits = 0
@@ -944,17 +1072,25 @@ def greedy_schedule(candidates, completed_courses, preferences=None):
             if c.get("term_locked") and c["term_locked"] != term["code"]:
                 continue
 
-            # Check offering frequency
-            if term["is_fall"] and not c.get("offered_fall", True):
-                continue
-            if not term["is_fall"] and not c.get("offered_spring", True):
-                continue
+            # Check offering frequency for this term's season. Default True
+            # (allow when unknown), consistent with fall/spring — the
+            # disclaimer covers advisor verification.
+            if term.get("is_summer"):
+                if not c.get("offered_summer", True):
+                    continue
+            elif term["is_fall"]:
+                if not c.get("offered_fall", True):
+                    continue
+            else:
+                if not c.get("offered_spring", True):
+                    continue
 
             # Check prerequisites (see prereqs_satisfied for AND/OR semantics)
             if not prereqs_satisfied(c.get("prereqs", []), c.get("prereq_raw"), scheduled):
                 continue
-            # Don't schedule a course in F26 if its prereq is also in F26
-            if term["code"] == "F26":
+            # Don't schedule a course in the first term if its prereq is also
+            # in progress in the first term
+            if term["code"] == first_term_code:
                 prereqs_in_progress = any(
                     prereq in in_progress_codes
                     for prereq in c.get("prereqs", [])
@@ -1132,11 +1268,16 @@ def optimize_plan(parsed_apas, preferences=None):
     if preferences is None:
         preferences = {}
 
+    # Derive the plannable terms from the student's expected graduation date,
+    # so the plan ends at the right term for any student (not a fixed F26-SP28).
+    terms = build_terms(parsed_apas.get("student", {}).get("expected_graduation"))
+
     completed_courses = [c for c in parsed_apas.get("completed_courses", [])
                         if not c.get("is_withdrawn")]
 
     # Build candidate courses to schedule, respecting difficulty/timeline prefs
-    candidates = build_candidate_courses(parsed_apas, preferences=preferences)
+    candidates = build_candidate_courses(parsed_apas, preferences=preferences,
+                                         terms=terms)
 
     print(f"Built {len(candidates)} candidate courses to schedule.",
           file=sys.stderr)
@@ -1149,13 +1290,13 @@ def optimize_plan(parsed_apas, preferences=None):
 
     # Run greedy scheduler
     plan, unscheduled = greedy_schedule(candidates, completed_courses,
-                                        preferences)
+                                        preferences, terms=terms)
 
     # Format output
     formatted_plan = []
     total_scheduled_credits = 0
 
-    for term in TERMS:
+    for term in terms:
         term_courses = plan[term["code"]]
         term_credits = sum(c["credits"] for c in term_courses)
         total_scheduled_credits += term_credits

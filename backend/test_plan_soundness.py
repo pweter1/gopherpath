@@ -28,17 +28,24 @@ optimize_plan) and asserts a checklist of soundness rules:
   8. Requirements coverage  — every non-meta remaining requirement is either
                               addressed by a scheduled course or listed in
                               unscheduled; nothing silently dropped
+  9. Term structure         — plan terms are derived from the student's
+                              expected_graduation: first term is the next
+                              term after today, last term is at/before the
+                              graduation term, count is 1..MAX_PLAN_TERMS, and
+                              the term codes match build_terms() exactly
 
 Usage:  python backend/test_plan_soundness.py
 """
 
 import os
 import sys
+import datetime
 
 sys.path.insert(0, os.path.dirname(__file__))
 
 from optimizer import (  # noqa: E402
     optimize_plan,
+    build_terms,
     get_course_from_db,
     extract_simple_prereqs,
     prereqs_satisfied,
@@ -49,6 +56,7 @@ from optimizer import (  # noqa: E402
     MIN_BIO_PHYS_COURSE_CREDITS,
     DEFAULT_MAX_CREDITS,
     ASAP_MAX_CREDITS,
+    MAX_PLAN_TERMS,
 )
 
 STUDENT_ID = 17
@@ -72,6 +80,32 @@ def load_student_parse(student_id):
 
 def is_meta_requirement(category):
     return any(kw.lower() in category.lower() for kw in SKIP_META_KEYWORDS)
+
+
+def expected_first_term_code(today):
+    """
+    The next plannable term after `today`, computed independently of
+    optimizer internals (Jan-May spring, Jun-Aug summer, Sep-Dec fall;
+    a summer start is skipped to the following fall).
+    """
+    season = 0 if today.month <= 5 else (1 if today.month <= 8 else 2)
+    idx = today.year * 3 + season + 1
+    if idx % 3 == 1:  # summer -> skip to fall
+        idx += 1
+    year, s = divmod(idx, 3)
+    yy = year % 100
+    return f"F{yy:02d}" if s == 2 else (f"SP{yy:02d}" if s == 0 else f"SU{yy:02d}")
+
+
+def code_to_index(term_code):
+    """Convert a term code ('F26','SP27','SU27') to a monotonic term index."""
+    if term_code.startswith("SP"):
+        season, year = 0, int(term_code[2:])
+    elif term_code.startswith("SU"):
+        season, year = 1, int(term_code[2:])
+    else:  # F##
+        season, year = 2, int(term_code[1:])
+    return (year + 2000) * 3 + season
 
 
 def run_checks(parsed_apas, result, max_credits_cap=DEFAULT_MAX_CREDITS):
@@ -290,6 +324,46 @@ def run_checks(parsed_apas, result, max_credits_cap=DEFAULT_MAX_CREDITS):
             f"no scheduled course and no unscheduled entry"
         ))
 
+    # ── Rule 9: term structure (dynamic terms from expected_graduation) ──
+    grad = parsed_apas.get("student", {}).get("expected_graduation")
+    plan_codes = [t["term_code"] for t in result["plan"]]
+    today = datetime.date.today()
+
+    if not plan_codes:
+        failures.append(("9 Term structure", "plan has no terms"))
+    else:
+        # 9a: first term is the next plannable term after today
+        expected_first = expected_first_term_code(today)
+        if plan_codes[0] != expected_first:
+            failures.append((
+                "9 Term structure",
+                f"first term {plan_codes[0]} != expected next term "
+                f"{expected_first} after {today}"
+            ))
+        # 9b: last term is at or before the graduation term
+        from optimizer import _parse_graduation  # noqa: E402
+        parsed_grad = _parse_graduation(grad)
+        if parsed_grad:
+            grad_idx = parsed_grad[0] * 3 + parsed_grad[1]
+            if code_to_index(plan_codes[-1]) > grad_idx:
+                failures.append((
+                    "9 Term structure",
+                    f"last term {plan_codes[-1]} is after graduation {grad!r}"
+                ))
+        # 9c: term count is sane
+        if not (1 <= len(plan_codes) <= MAX_PLAN_TERMS):
+            failures.append((
+                "9 Term structure",
+                f"term count {len(plan_codes)} outside 1..{MAX_PLAN_TERMS}"
+            ))
+        # 9d: plan terms match build_terms() exactly (optimize_plan used it)
+        expected_codes = [t["code"] for t in build_terms(grad, today)]
+        if plan_codes != expected_codes:
+            failures.append((
+                "9 Term structure",
+                f"plan terms {plan_codes} != build_terms() {expected_codes}"
+            ))
+
     return failures, warnings, double_dips
 
 
@@ -437,7 +511,7 @@ def main():
                 for rule, msg in failures:
                     print(f"    [{rule}] {msg}")
             else:
-                print("  PASSED: all 8 soundness rules hold.")
+                print("  PASSED: all 9 soundness rules hold.")
 
     analyze_timeline_effect(results)
     analyze_difficulty_effect(results)
@@ -446,7 +520,7 @@ def main():
     if any_failures:
         print("RESULT: FAILED — at least one combination violated a soundness rule.")
         sys.exit(1)
-    print("RESULT: PASSED — all 8 combinations satisfy all 8 soundness rules.")
+    print("RESULT: PASSED — all 8 combinations satisfy all 9 soundness rules.")
 
 
 if __name__ == "__main__":

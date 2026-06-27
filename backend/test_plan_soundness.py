@@ -51,6 +51,7 @@ from optimizer import (  # noqa: E402
     prereqs_satisfied,
     is_parent_header_requirement,
     is_restricted_section,
+    _normalize_le_category,
     SKIP_META_KEYWORDS,
     MIN_LE_COURSE_CREDITS,
     MIN_BIO_PHYS_COURSE_CREDITS,
@@ -337,9 +338,12 @@ def run_checks(parsed_apas, result, max_credits_cap=DEFAULT_MAX_CREDITS):
         # credits_needed=None row with no children never reaches this branch
         # (is_parent_header_requirement returns False) and fails below.
         if is_parent_header_requirement(req, remaining):
+            # Normalize both sides so colon-style children (e.g.
+            # 'Designated Themes: Civic Life and Ethics') are matched.
+            parent_prefix = _normalize_le_category(category) + " - "
             children = [
                 r for r in remaining
-                if r.get("category", "").startswith(category + " - ")
+                if _normalize_le_category(r.get("category", "")).startswith(parent_prefix)
             ]
             unaccounted = [
                 r["category"] for r in children if not is_accounted_for(r)

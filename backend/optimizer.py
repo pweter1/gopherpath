@@ -381,6 +381,23 @@ WI_ADDITIONAL_COURSES = POLICY["writing_intensive"]["additional_courses_to_sched
 DOUBLE_COUNT_WI_COURSES = set(POLICY["writing_intensive"]["double_count_courses"].keys())
 
 
+def _normalize_le_category(category):
+    """
+    Normalize APAS parser variants to match LE_MAPPING keys.
+    Handles: colon separators, 'Liberal Education - ' prefix.
+    e.g. 'Liberal Education - Diversified Core: Historical Perspectives'
+         → 'Diversified Core - Historical Perspectives'
+    """
+    normalized = category.strip()
+    # Strip known parser-added prefixes
+    for prefix in ("Liberal Education - ", "Liberal Ed - "):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix):]
+    # Normalize colon separators to dash separators
+    normalized = normalized.replace(": ", " - ")
+    return normalized
+
+
 def is_wi_parent_requirement(category):
     """
     True for the bare overall Writing Intensive requirement (with any
@@ -407,9 +424,12 @@ def is_parent_header_requirement(req, all_requirements):
     category = req.get("category", "")
     if is_wi_parent_requirement(category):
         return False
-    prefix = category + " - "
+    # Normalize both sides so colon-style children (e.g.
+    # 'Designated Themes: Civic Life and Ethics') are recognized as children
+    # of 'Designated Themes'.
+    prefix = _normalize_le_category(category) + " - "
     return any(
-        other.get("category", "").startswith(prefix)
+        _normalize_le_category(other.get("category", "")).startswith(prefix)
         for other in all_requirements
         if other is not req
     )
@@ -422,14 +442,18 @@ def match_le_category(requirement_category):
     The Claude-based APAS parser is not consistent about category names:
       - parent-group prefixes vary ('Liberal Education - Diversified Core -...'
         vs 'Diversified Core -...')
+      - separators vary (': ' vs ' - ')
       - names can be truncated ('Diversified Core - Historical Perspectives'
-        for '...Historical Perspectives & Social Sciences')
-    So we try, in order: exact lookup, suffix match (absorbs a prefix), then
-    prefix match (absorbs a truncated tail).
+        for '...Historical Perspectives & Social Sciences') or carry a
+        redundant tail ('...Arts/Humanities & Literature - Literature')
+    So we normalize first (see _normalize_le_category), then try, in order:
+    exact, suffix (absorbs a prefix), prefix (absorbs a truncated tail), and
+    reverse-prefix (absorbs a redundant tail).
 
     Returns the CLE value list, or None if the category isn't a Liberal Ed
     requirement we can query.
     """
+    requirement_category = _normalize_le_category(requirement_category)
     values = LE_MAPPING.get(requirement_category)
     if values:
         return values
@@ -441,6 +465,11 @@ def match_le_category(requirement_category):
     # Guard against the WI sentinel key (empty-ish) matching everything.
     for key, vals in LE_MAPPING.items():
         if vals != [None] and key.startswith(requirement_category):
+            return vals
+    # Reverse-prefix: requirement carries a redundant tail after a known key
+    # (e.g. 'Diversified Core - Arts/Humanities & Literature - Literature').
+    for key, vals in LE_MAPPING.items():
+        if vals != [None] and requirement_category.startswith(key):
             return vals
     return None
 

@@ -15,6 +15,7 @@
 
   "liberal_education": {
     "_source": "https://curricularhub.umn.edu undergraduate Liberal Education Guidelines",
+    "_parser_notes": "The APAS parser produces inconsistent Liberal Ed category formats across parses: dash separators vs colon separators, with or without 'Liberal Education - ' prefix. All variants are normalized in match_le_category() before LE_MAPPING lookup.",
     "default_min_credits": 3.0,
     "categories": {
       "Biological Sciences": {"min_credits": 4.0},

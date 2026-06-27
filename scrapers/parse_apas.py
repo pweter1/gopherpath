@@ -94,7 +94,7 @@ Extract the following information exactly as it appears in the document:
     "major": "string",
     "college": "string or null",
     "catalog_year": "string or null",
-    "expected_graduation": "string (e.g. 'Spr 28' or 'Fall 2028')",
+    "expected_graduation": null (ALWAYS null — see rule 9),
     "advisor": "string or null (use first advisor if multiple)"
   },
   "credits": {
@@ -149,6 +149,7 @@ Rules:
 6. If a field is not present in the document, use null, not a placeholder string.
 7. Course numbers may have suffixes like 'W' (writing intensive) or 'H' (honors) — preserve them exactly.
 8. Do not infer or add any information not explicitly present in the document.
+9. The "Expected Grad Term" field on UMN APAS reports is ALWAYS blank — it exists as a column header but is never populated. Do NOT attempt to extract it and do NOT substitute the Catalog Year, last enrollment term, or any other date. ALWAYS return null for expected_graduation. The student will be asked for their graduation date separately.
 """
 
 def parse_apas_with_claude(apas_text):
@@ -214,8 +215,13 @@ def validate_parsed_apas(data):
     if "student" in data:
         if not data["student"].get("major"):
             errors.append("Missing student major")
+        # expected_graduation is ALWAYS blank on UMN APAS reports (the column
+        # exists but is never populated), so a missing value is expected, not
+        # an error — the student is prompted to enter it on the confirm screen.
         if not data["student"].get("expected_graduation"):
-            errors.append("Missing expected graduation term")
+            print("[parse_apas] WARNING: Expected graduation term not found in "
+                  "APAS — student will be prompted to enter it manually.",
+                  file=sys.stderr)
 
     if "credits" in data:
         earned = data["credits"].get("earned", 0)

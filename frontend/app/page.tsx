@@ -12,7 +12,7 @@
 
 "use client";
 
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback, useEffect, useRef, useMemo } from "react";
 import {
   parseAPAS,
   optimizePlan,
@@ -35,6 +35,30 @@ interface PreferenceData {
   freeText: string;
 }
 
+// The APAS never provides a graduation term, so the student picks one on the
+// confirm screen. Options are the next 8 Fall/Spring terms (4 years) starting
+// from the next term after today — matching the optimizer's term model.
+function generateGradOptions(): { value: string; label: string }[] {
+  const now = new Date();
+  const month = now.getMonth(); // 0 = Jan
+  // season: 0 spring (Jan-May), 1 summer (Jun-Aug), 2 fall (Sep-Dec)
+  const season = month <= 4 ? 0 : month <= 7 ? 1 : 2;
+  let idx = now.getFullYear() * 3 + season + 1; // next term after today
+  if (idx % 3 === 1) idx += 1; // never start in summer
+
+  const opts: { value: string; label: string }[] = [];
+  while (opts.length < 8) {
+    const s = idx % 3;
+    if (s !== 1) {
+      const year = Math.floor(idx / 3);
+      const label = s === 2 ? `Fall ${year}` : `Spring ${year}`;
+      opts.push({ value: label, label });
+    }
+    idx += 1;
+  }
+  return opts;
+}
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -44,7 +68,12 @@ type AppState =
   | { stage: "restoring" }
   | { stage: "uploading" }
   | { stage: "confirming"; sessionToken: string; parsedData: ParsedAPAS }
-  | { stage: "preferences"; sessionToken: string; parsedData: ParsedAPAS }
+  | {
+      stage: "preferences";
+      sessionToken: string;
+      parsedData: ParsedAPAS;
+      expectedGraduation: string;
+    }
   | { stage: "optimizing"; sessionToken: string; parsedData: ParsedAPAS }
   | {
       stage: "plan";
@@ -200,10 +229,12 @@ function ConfirmStage({
   onReset,
 }: {
   parsedData: ParsedAPAS;
-  onConfirm: () => void;
+  onConfirm: (expectedGraduation: string) => void;
   onReset: () => void;
 }) {
   const { student, credits, gpa } = parsedData;
+  const gradOptions = useMemo(() => generateGradOptions(), []);
+  const [gradTerm, setGradTerm] = useState("");
 
   return (
     <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center p-8">
@@ -228,12 +259,6 @@ function ConfirmStage({
             <span className="font-medium text-gray-900">{student.major}</span>
           </div>
           <div className="flex justify-between">
-            <span className="text-gray-500">Expected Graduation</span>
-            <span className="font-medium text-gray-900">
-              {student.expected_graduation}
-            </span>
-          </div>
-          <div className="flex justify-between">
             <span className="text-gray-500">Credits Earned</span>
             <span className="font-medium text-gray-900">
               {credits.earned} / {credits.total_required}
@@ -251,6 +276,35 @@ function ConfirmStage({
           </div>
         </div>
 
+        {/* Graduation term — APAS never provides this, so we ask directly */}
+        <div className="bg-white rounded-xl border border-gray-200 p-6 mb-6">
+          <label
+            htmlFor="grad-term"
+            className="block text-sm font-medium text-gray-900 mb-1"
+          >
+            When do you expect to graduate? <span className="text-red-600">*</span>
+          </label>
+          <p className="text-xs text-gray-500 mb-3">
+            Your APAS doesn&apos;t include a graduation term, so we need this to
+            build your semester plan.
+          </p>
+          <select
+            id="grad-term"
+            value={gradTerm}
+            onChange={(e) => setGradTerm(e.target.value)}
+            className="w-full border border-gray-300 rounded-lg px-3 py-2.5 text-sm text-gray-900 focus:outline-none focus:border-red-400 bg-white"
+          >
+            <option value="" disabled>
+              Select your expected graduation term…
+            </option>
+            {gradOptions.map((opt) => (
+              <option key={opt.value} value={opt.value}>
+                {opt.label}
+              </option>
+            ))}
+          </select>
+        </div>
+
         <div className="flex gap-3">
           <button
             onClick={onReset}
@@ -259,8 +313,9 @@ function ConfirmStage({
             Upload Different File
           </button>
           <button
-            onClick={onConfirm}
-            className="flex-1 py-2.5 bg-red-600 text-white rounded-lg text-sm font-medium hover:bg-red-700 transition-colors"
+            onClick={() => onConfirm(gradTerm)}
+            disabled={!gradTerm}
+            className="flex-1 py-2.5 bg-red-600 text-white rounded-lg text-sm font-medium hover:bg-red-700 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
           >
             Generate My Plan →
           </button>
@@ -1076,21 +1131,22 @@ export default function Home() {
     }
   };
 
-  const handleConfirm = () => {
+  const handleConfirm = (expectedGraduation: string) => {
     if (state.stage !== "confirming") return;
     setState({
       stage: "preferences",
       sessionToken: state.sessionToken,
       parsedData: state.parsedData,
+      expectedGraduation,
     });
   };
 
   const handlePreferences = async (prefs: PreferenceData) => {
     if (state.stage !== "preferences") return;
-    const { sessionToken, parsedData } = state;
+    const { sessionToken, parsedData, expectedGraduation } = state;
     setState({ stage: "optimizing", sessionToken, parsedData });
     try {
-      const plan = await optimizePlan(sessionToken, prefs);
+      const plan = await optimizePlan(sessionToken, { ...prefs, expectedGraduation });
       localStorage.setItem(SESSION_KEY, sessionToken);
       setState({ stage: "plan", sessionToken, parsedData, plan });
     } catch (err: any) {

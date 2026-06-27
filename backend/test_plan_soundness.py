@@ -59,7 +59,8 @@ from optimizer import (  # noqa: E402
     MAX_PLAN_TERMS,
 )
 
-STUDENT_ID = 17
+# Default test subject; override with SOUNDNESS_STUDENT_ID=<n> to target another.
+STUDENT_ID = int(os.environ.get("SOUNDNESS_STUDENT_ID", "22"))
 
 
 def load_student_parse(student_id):

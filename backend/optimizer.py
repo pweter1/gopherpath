@@ -143,9 +143,15 @@ def build_terms(expected_graduation, today=None):
 
     grad = _parse_graduation(expected_graduation)
     if grad is None:
-        print(f"[optimizer] WARNING: unparseable expected_graduation "
-              f"{expected_graduation!r}; using fallback terms.", file=sys.stderr)
-        return [dict(t) for t in TERMS]
+        # UMN APAS never populates the grad term, so null is the common case
+        # (the student should have been prompted on the confirm screen). Use 4
+        # terms from the current term — a reasonable, year-agnostic default —
+        # NOT the year-specific module-level TERMS.
+        print(f"[optimizer] WARNING: missing/unparseable expected_graduation "
+              f"{expected_graduation!r}; defaulting to 4 terms from the current "
+              f"term. The student should set their graduation date.",
+              file=sys.stderr)
+        return _regular_terms_from(start_idx, 4)
 
     grad_idx = _term_index(*grad)
     if grad_idx < start_idx:

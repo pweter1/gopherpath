@@ -38,6 +38,8 @@ class Preferences(BaseModel):
     timeline: str = "on_time"        # "asap", "on_time"
     max_credits: Optional[int] = None
     free_text: Optional[str] = None  # raw student input
+    expected_graduation: Optional[str] = None  # student-entered grad term
+                                               # (APAS never provides it)
 
 
 class ChatMessage(BaseModel):
@@ -658,6 +660,13 @@ def optimize_plan_endpoint(session_token: str, preferences: Preferences):
 
         parsed_apas = row[0]
 
+        # The APAS never provides a graduation term, so the student enters it
+        # on the confirm screen. Apply it to the stored APAS before optimizing
+        # so build_terms() (and any later chat/restore) sees the right date.
+        if preferences.expected_graduation:
+            parsed_apas.setdefault("student", {})["expected_graduation"] = \
+                preferences.expected_graduation
+
         # Convert preferences to optimizer format
         prefs = {
             "difficulty": preferences.difficulty,
@@ -676,19 +685,27 @@ def optimize_plan_endpoint(session_token: str, preferences: Preferences):
         # Drop chat_history and plan_explanation: they describe the previous
         # plan, and the frontend re-runs the advisor init sequence (explanation,
         # requirements card, follow-up) when no saved messages exist.
+        # Also persist the student-entered graduation term so session restore
+        # and chat see it.
+        grad = preferences.expected_graduation or \
+            parsed_apas.get("student", {}).get("expected_graduation")
         cursor.execute("""
             UPDATE students
             SET parsed_apas_json = jsonb_set(
                 jsonb_set(
-                    parsed_apas_json::jsonb - 'chat_history' - 'plan_explanation',
-                    '{generated_plan}',
+                    jsonb_set(
+                        parsed_apas_json::jsonb - 'chat_history' - 'plan_explanation',
+                        '{generated_plan}',
+                        %s::jsonb
+                    ),
+                    '{preferences}',
                     %s::jsonb
                 ),
-                '{preferences}',
+                '{student,expected_graduation}',
                 %s::jsonb
             )
             WHERE session_token = %s
-        """, (json.dumps(plan), json.dumps(prefs), session_token))
+        """, (json.dumps(plan), json.dumps(prefs), json.dumps(grad), session_token))
         conn.commit()
 
         return {"status": "success", "plan": plan}

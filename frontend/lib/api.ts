@@ -39,6 +39,9 @@ export interface PreferenceData {
   difficulty: string;
   timeline: string;
   freeText: string;
+  // Student-entered graduation term (e.g. "Spring 2028"). The APAS never
+  // provides this, so it's collected on the confirm screen.
+  expectedGraduation: string;
 }
 
 export interface Plan {
@@ -217,6 +220,7 @@ export async function optimizePlan(
       difficulty: preferences.difficulty,
       timeline: preferences.timeline,
       free_text: preferences.freeText,
+      expected_graduation: preferences.expectedGraduation,
     }),
   });
 

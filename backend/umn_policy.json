@@ -25,6 +25,8 @@
       "Diversified Core - Biological & Physical Sciences": ["Biological Sciences", "Physical Sciences"],
       "Diversified Core - Historical Perspectives & Social Sciences": ["Historical Perspectives", "Social Sciences"],
       "Diversified Core - Arts/Humanities & Literature": ["Arts/Humanities", "Literature"],
+      "Diversified Core - Historical Perspectives": ["Historical Perspectives", "Social Sciences"],
+      "Diversified Core - Literature": ["Arts/Humanities", "Literature"],
       "Designated Themes - Civic Life and Ethics": ["Civic Life and Ethics"],
       "Designated Themes - Global Perspectives": ["Global Perspectives"],
       "Designated Themes - Technology and Society": ["Technology and Society"],
@@ -59,6 +61,9 @@
     "S Grade Credit",
     "Credits Completed",
     "Degree-Applicable",
-    "Elective Credits"
+    "Elective Credits",
+    "Upper-Division Credits",
+    "Level Credit Minimum",
+    "Sub-Plan Requirement"
   ]
 }

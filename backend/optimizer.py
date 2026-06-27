@@ -419,11 +419,13 @@ def match_le_category(requirement_category):
     """
     Maps an APAS requirement category to its CLE attribute values.
 
-    The Claude-based APAS parser is not consistent about parent-group
-    prefixes: the same requirement can parse as
-    'Diversified Core - Biological & Physical Sciences' in one upload and
-    'Liberal Education - Diversified Core - Biological & Physical Sciences'
-    in the next. Exact lookup first, then suffix match to absorb any prefix.
+    The Claude-based APAS parser is not consistent about category names:
+      - parent-group prefixes vary ('Liberal Education - Diversified Core -...'
+        vs 'Diversified Core -...')
+      - names can be truncated ('Diversified Core - Historical Perspectives'
+        for '...Historical Perspectives & Social Sciences')
+    So we try, in order: exact lookup, suffix match (absorbs a prefix), then
+    prefix match (absorbs a truncated tail).
 
     Returns the CLE value list, or None if the category isn't a Liberal Ed
     requirement we can query.
@@ -433,6 +435,12 @@ def match_le_category(requirement_category):
         return values
     for key, vals in LE_MAPPING.items():
         if requirement_category.endswith(key):
+            return vals
+    # Prefix match: requirement is a truncation of a known key (e.g.
+    # 'Diversified Core - Historical Perspectives' -> '...& Social Sciences').
+    # Guard against the WI sentinel key (empty-ish) matching everything.
+    for key, vals in LE_MAPPING.items():
+        if vals != [None] and key.startswith(requirement_category):
             return vals
     return None
 
@@ -778,25 +786,39 @@ def build_candidate_courses(parsed_apas, preferences=None, terms=None):
     first_term_code = terms[0]["code"]
 
     candidates = []
+    candidate_by_code = {}  # code -> candidate dict (for crediting double-dips)
     in_progress = {f"{c['subject']} {c['number']}"
                    for c in parsed_apas.get("in_progress_courses", [])}
+    completed_codes = {
+        f"{c['subject']} {c['number']}"
+        for c in parsed_apas.get("completed_courses", [])
+        if not c.get("is_withdrawn")
+    }
 
-    # Add in-progress courses as locked to the first plannable term
+    # Add in-progress courses as locked to the first plannable term.
+    # Dedup by code: the APAS parser can list the same course twice (student
+    # 22's MATH 2263), which would otherwise double-count its credits.
     for course in parsed_apas.get("in_progress_courses", []):
+        code = f"{course['subject']} {course['number']}"
+        if code in candidate_by_code:
+            continue
         db_course = get_course_from_db(course["subject"], course["number"])
-        candidates.append({
+        cand = {
             "subject": course["subject"],
             "number": course["number"],
             "title": course.get("title", ""),
             "credits": course.get("credits", 3.0),
             "requirement_category": "In Progress",
+            "satisfies_categories": ["In Progress"],
             "is_pinned": True,
             "term_locked": first_term_code,
             "offered_fall": True,
             "offered_spring": True,
             "prereqs": [],
             "prereq_raw": db_course["prereq_raw"] if db_course else "",
-        })
+        }
+        candidates.append(cand)
+        candidate_by_code[code] = cand
 
     # Phase 1: pinned requirements (explicit options lists). Open
     # requirements are collected in order and handled in phases 2-3 below,
@@ -841,14 +863,35 @@ def build_candidate_courses(parsed_apas, preferences=None, terms=None):
             if is_restricted_section(number):
                 continue  # skip Honors/honors-variant sections in requirements options lists
 
-            if code in in_progress or code in added_this_req:
+            if code in added_this_req:
+                continue
+
+            # Already enrolled in this option: don't re-add it. Credit this
+            # requirement to the in-progress course (it will be scheduled in
+            # the first term) so coverage reflects that it's satisfied.
+            if code in in_progress:
+                ip = candidate_by_code.get(code)
+                if ip and category not in ip["satisfies_categories"]:
+                    ip["satisfies_categories"].append(category)
+                added_this_req.add(code)
+                continue
+
+            # Already completed this option — the requirement is satisfied by
+            # prior coursework; nothing to schedule.
+            if code in completed_codes:
+                added_this_req.add(code)
                 continue
 
             db_course = get_course_from_db(subject, number)
+            if db_course is None:
+                # Major-specific course not in our DB — fall back to APAS data
+                # so it still appears in the plan/unscheduled, never dropped.
+                print(f"[optimizer] Course {subject} {number} not found in "
+                      f"database — using APAS data as fallback", file=sys.stderr)
             prereqs = extract_simple_prereqs(subject, number)
             course_credits = db_course["credits"] if db_course else 3.0
 
-            candidates.append({
+            cand = {
                 "subject": subject,
                 "number": number,
                 "title": db_course["title"] if db_course else option,
@@ -861,7 +904,9 @@ def build_candidate_courses(parsed_apas, preferences=None, terms=None):
                 "offered_summer": db_course["offered_summer"] if db_course else True,
                 "prereqs": prereqs,
                 "prereq_raw": db_course["prereq_raw"] if db_course else "",
-            })
+            }
+            candidates.append(cand)
+            candidate_by_code.setdefault(code, cand)
             added_this_req.add(code)
             credits_to_fill -= course_credits
 

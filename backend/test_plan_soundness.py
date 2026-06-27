@@ -187,13 +187,33 @@ def run_checks(parsed_apas, result, max_credits_cap=DEFAULT_MAX_CREDITS):
             ))
 
     # ── Rule 4: credit caps ──────────────────────────────────────────────
+    # The first term locks in-progress courses the student is already enrolled
+    # in — we can't un-enroll them, so if those alone exceed the cap that's an
+    # honest overflow, not a planning failure. It's only a failure if the
+    # optimizer ADDED non-in-progress courses on top of an already-full term.
+    first_term_code = terms[0]["term_code"] if terms else None
     for term in terms:
-        if term["total_credits"] > max_credits_cap:
-            failures.append((
-                "4 Credit caps",
-                f"{term['term_code']} has {term['total_credits']} credits "
-                f"(cap {max_credits_cap})"
-            ))
+        if term["total_credits"] <= max_credits_cap:
+            continue
+        ip_credits = sum(
+            c["credits"] for c in term["courses"]
+            if c.get("requirement_category") == "In Progress"
+        )
+        other_credits = term["total_credits"] - ip_credits
+        if term["term_code"] == first_term_code and ip_credits > max_credits_cap \
+                and other_credits == 0:
+            warnings.append(
+                f"NOTE: {term['term_code']} credit cap exceeded by in-progress "
+                f"courses alone ({ip_credits}cr) — student is already enrolled, "
+                f"this is correct behavior"
+            )
+            continue
+        failures.append((
+            "4 Credit caps",
+            f"{term['term_code']} has {term['total_credits']} credits "
+            f"(cap {max_credits_cap}; in-progress {ip_credits}cr, "
+            f"other {other_credits}cr)"
+        ))
 
     # ── Rule 5: offering correctness ─────────────────────────────────────
     for term in terms:
@@ -283,12 +303,24 @@ def run_checks(parsed_apas, result, max_credits_cap=DEFAULT_MAX_CREDITS):
         if len(cats) > 1:
             double_dips.append((code, sorted(cats)))
 
+    def satisfied_by_completed(r):
+        """A requirement option the student has already completed satisfies it
+        (nothing to schedule), so it's accounted for — not a silent drop."""
+        for opt in r.get("options") or []:
+            parts = opt.strip().split()
+            if len(parts) >= 2:
+                code = f"{parts[0]} {' '.join(parts[1:])}"
+                if code in completed_codes:
+                    return True
+        return False
+
     def is_accounted_for(r):
         cat = r.get("category", "")
         return (
             is_meta_requirement(cat)
             or cat in scheduled_categories
             or cat in unscheduled_categories
+            or satisfied_by_completed(r)
         )
 
     for req in remaining:
@@ -296,6 +328,8 @@ def run_checks(parsed_apas, result, max_credits_cap=DEFAULT_MAX_CREDITS):
         if is_meta_requirement(category):
             continue
         if category in scheduled_categories or category in unscheduled_categories:
+            continue
+        if satisfied_by_completed(req):
             continue
         # Parent/group header rows (credits_needed=None with separately
         # tracked children) are intentionally skipped by the optimizer —

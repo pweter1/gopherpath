@@ -18,6 +18,7 @@ import sys
 import hashlib
 import secrets
 import json
+import traceback
 import psycopg2
 import anthropic
 from dotenv import load_dotenv
@@ -116,15 +117,17 @@ def save_student_to_db(parsed_data):
     The JSONB column means we can query into the JSON later if needed,
     e.g. SELECT * FROM students WHERE parsed_apas_json->'credits'->>'earned' > '80'
     """
-    token = generate_session_token()
-    student = parsed_data.get("student", {})
-    credits = parsed_data.get("credits", {})
-    gpa = parsed_data.get("gpa", {})
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
-
+    conn = None
+    cursor = None
     try:
+        token = generate_session_token()
+        student = parsed_data.get("student", {})
+        credits = parsed_data.get("credits", {})
+        gpa = parsed_data.get("gpa", {})
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
         cursor.execute("""
             INSERT INTO students (
                 session_token, name, student_id_hash,
@@ -167,12 +170,17 @@ def save_student_to_db(parsed_data):
         return token
 
     except Exception as e:
-        conn.rollback()
-        raise e
+        if conn is not None:
+            conn.rollback()
+        print(f"[save_student_to_db] ERROR: {e}", file=sys.stderr)
+        print(traceback.format_exc(), file=sys.stderr)
+        raise
 
     finally:
-        cursor.close()
-        conn.close()
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +227,15 @@ async def parse_apas_endpoint(file: UploadFile = File(...)):
             )
 
         # Save to database and get session token
-        session_token = save_student_to_db(parsed_data)
+        try:
+            session_token = save_student_to_db(parsed_data)
+        except Exception as e:
+            print(f"[parse-apas] Failed to save to DB: {e}", file=sys.stderr)
+            print(traceback.format_exc(), file=sys.stderr)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to save student data: {str(e)}"
+            )
 
         return {
             "status": "success",
